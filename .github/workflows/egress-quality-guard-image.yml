@@ -1,0 +1,82 @@
+name: 发布出口质量守护镜像
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: egress-quality-guard-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 测试、构建并发布
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 运行出口质量守护单元测试
+        run: >-
+          python -m unittest -v
+          tools/egress-quality-guard/quality_guard_test.py
+          tools/egress-quality-guard/session_rotator_test.py
+
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 生成镜像元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/grok2api-egress-quality-guard
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=grok2api 出口质量守护多平台 Docker 镜像
+            org.opencontainers.image.licenses=MIT
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 登录 GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: 构建并发布多平台镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./tools/egress-quality-guard/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=egress-quality-guard
+          cache-to: type=gha,scope=egress-quality-guard,mode=max
+          provenance: mode=max
+          sbom: true
