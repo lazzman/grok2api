@@ -17,10 +17,14 @@ description: 安全地将当前 Grok2API 分支的本地提交 rebase 到上游�
 ## 不可违反的规则
 
 - 必须先抓取 `upstream`，禁止基于过期的远程跟踪引用 rebase。
-- 禁止使用 `git reset --hard`、`git clean -fd`、`git rebase --skip`、普通 `--force`，以及删除本地提交或覆盖未提交工作。
+- 禁止使用 `git reset --hard`、`git clean -fd`、`git rebase --skip`、普通 `--force`，以及覆盖未提交工作。删除本地提交只允许下面的等价功能例外。
 - 工作区不干净时，必须使用 `git stash push --include-untracked`；成功后必须恢复 stash。
 - rebase 冲突中，`--ours` 是 `upstream` 基线，`--theirs` 是正在重放的本地提交。先阅读三方版本和 `REBASE_HEAD`，再合并双方有效改动。
 - 不得向 `upstream` 推送。发布到 `origin` 时只能使用带租约的强制推送。
+- 禁止无故删除本地提交。唯一例外：某个本地提交新增的功能，在当前 `upstream/main` 上已经有等价实现。不按作者或仓库名判断；上游是谁都一样，重复功能不要继续重放。
+- 等价指同一用户可见能力，不要求提交哈希或 diff 相同。用设置项、接口、错误标记和关键类型判断。文件路径重合，或上游只覆盖了该提交的一部分，都不是等价。
+- 仍含本地独有行为的提交必须保留。只丢掉已经被当前上游完整覆盖的那一个提交。
+- 丢提交使用 `git rebase --onto <上游> <被丢提交> <分支>`，或在序列编辑器里删除该行。不要用 `git reset --hard`、`git rebase --skip` 或普通 `--force`。未提交改动仍先 stash，结束后恢复。
 
 ## 执行
 
