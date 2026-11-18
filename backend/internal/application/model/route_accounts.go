@@ -10,8 +10,6 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
-const maxRouteAccountBindings = 1000
-
 type AddRouteAccountsExpected struct {
 	PublicID      string
 	Provider      account.Provider
@@ -71,9 +69,6 @@ func (s *Service) AddRouteAccounts(ctx context.Context, routeID uint64, input Ad
 }
 
 func normalizeRouteAccountIDs(ids []uint64) ([]uint64, error) {
-	if len(ids) > maxRouteAccountBindings {
-		return nil, invalidInput(fmt.Sprintf("单次最多绑定 %d 个账号", maxRouteAccountBindings))
-	}
 	unique := make(map[uint64]struct{}, len(ids))
 	result := make([]uint64, 0, len(ids))
 	for _, id := range ids {

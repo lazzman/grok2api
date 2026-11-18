@@ -11,6 +11,7 @@ import { z } from "zod";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { applyBoundAccountSelection } from "@/features/models/bound-accounts";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -181,6 +182,10 @@ export function ModelsPage() {
   function toggleBoundAccount(id: string, checked: boolean): void {
     const current = form.getValues("accountIds");
     form.setValue("accountIds", checked ? [...new Set([...current, id])] : current.filter((value) => value !== id), { shouldValidate: true });
+  }
+
+  function setVisibleAccountsBound(ids: string[], checked: boolean): void {
+    form.setValue("accountIds", applyBoundAccountSelection(form.getValues("accountIds"), ids, checked), { shouldValidate: true });
   }
 
   const accountOptions = accountOptionsQuery.data?.items ?? [];
@@ -380,6 +385,16 @@ export function ModelsPage() {
                 {bindingMode ? (
                   <div className="mt-3">
                     <div className="overflow-hidden rounded-md bg-background/55 p-1">
+                      {visibleAccountOptions.length > 0 ? (
+                        <div className="mb-1 flex flex-wrap items-center justify-end gap-2 px-1 pt-1">
+                          <Button type="button" variant="outline" size="sm" className="h-11 px-3 text-xs" disabled={visibleAccountOptions.every((account) => selectedAccountIDs.includes(account.id))} onClick={() => setVisibleAccountsBound(visibleAccountOptions.map((account) => account.id), true)}>
+                            {normalizedAccountSearch ? t("modelAccountSelection.selectFiltered", { count: visibleAccountOptions.length }) : t("modelAccountSelection.selectAll")}
+                          </Button>
+                          <Button type="button" variant="ghost" size="sm" className="h-11 px-3 text-xs" disabled={!visibleAccountOptions.some((account) => selectedAccountIDs.includes(account.id))} onClick={() => setVisibleAccountsBound(visibleAccountOptions.map((account) => account.id), false)}>
+                            {normalizedAccountSearch ? t("modelAccountSelection.clearFiltered") : t("modelAccountSelection.clearAll")}
+                          </Button>
+                        </div>
+                      ) : null}
                       <div className="relative">
                         <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                         <Input className="bg-transparent pl-8 shadow-none focus-visible:bg-background/70" value={accountSearch} onChange={(event) => setAccountSearch(event.target.value)} placeholder={t("models.searchAccounts")} />
@@ -392,7 +407,7 @@ export function ModelsPage() {
                           const controlId = `model-account-${account.id}`;
                           const checked = selectedAccountIDs.includes(account.id);
                           return (
-                            <label key={account.id} htmlFor={controlId} className={cn("flex h-8 cursor-pointer items-center gap-2.5 rounded-md px-2 text-xs transition-colors hover:bg-accent/40", checked && "bg-accent/55")}>
+                            <label key={account.id} htmlFor={controlId} className={cn("flex min-h-11 cursor-pointer items-center gap-2.5 rounded-md px-2 text-xs transition-colors hover:bg-accent/40", checked && "bg-accent/55")}>
                               <Checkbox id={controlId} checked={checked} onCheckedChange={(value) => toggleBoundAccount(account.id, value === true)} />
                               <span className="min-w-0 flex-1 truncate" title={account.name}>{account.name}</span>
                               <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">#{account.id}</span>

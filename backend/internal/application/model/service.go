@@ -332,18 +332,23 @@ func (s *Service) ListBindableAccounts(ctx context.Context, providerValue accoun
 	if !providerValue.IsValid() {
 		return nil, invalidInput("账号来源无效")
 	}
-	values, _, err := s.accounts.List(ctx, repository.AccountListQuery{
-		Page:   repository.PageQuery{Offset: 0, Limit: 1000},
-		Filter: repository.AccountListFilter{Provider: string(providerValue)},
-	})
-	if err != nil {
-		return nil, err
+	result := make([]AccountOption, 0)
+	for offset := 0; ; {
+		values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
+			Page:   repository.PageQuery{Offset: offset, Limit: repository.MaxPageSize},
+			Filter: repository.AccountListFilter{Provider: string(providerValue)},
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, value := range values {
+			result = append(result, AccountOption{ID: value.ID, Name: value.Name})
+		}
+		offset += len(values)
+		if len(values) == 0 || int64(offset) >= total {
+			return result, nil
+		}
 	}
-	result := make([]AccountOption, 0, len(values))
-	for _, value := range values {
-		result = append(result, AccountOption{ID: value.ID, Name: value.Name})
-	}
-	return result, nil
 }
 
 func (s *Service) validateProviderCapability(providerValue account.Provider, capability modeldomain.Capability) (provider.Definition, error) {

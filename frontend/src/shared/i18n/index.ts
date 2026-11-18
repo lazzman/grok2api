@@ -5,6 +5,12 @@ const resources = {
   "zh-CN": {
     translation: {
       appName: "Grok2API",
+      modelAccountSelection: {
+        selectAll: "全选",
+        selectFiltered: "全选筛选结果（{{count}}）",
+        clearAll: "清空",
+        clearFiltered: "取消筛选结果",
+      },
       webAccountSettings: {
         menu: "账号设置",
         acceptTerms: "接受服务协议",
@@ -1389,6 +1395,12 @@ const resources = {
   en: {
     translation: {
       appName: "Grok2API",
+      modelAccountSelection: {
+        selectAll: "Select all",
+        selectFiltered: "Select {{count}} matches",
+        clearAll: "Clear",
+        clearFiltered: "Clear matches",
+      },
       webAccountSettings: {
         menu: "Account settings",
         acceptTerms: "Accept terms",
