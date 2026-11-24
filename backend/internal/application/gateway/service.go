@@ -230,6 +230,8 @@ type Service struct {
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
 	qualityRetry                atomic.Pointer[QualityRetryRuntime]
+	shadowQualitySlots          chan struct{}
+	shadowQualityWG             sync.WaitGroup
 }
 
 type teamModelRateLimit struct {
@@ -268,10 +270,38 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
 		selector: selector, responses: responses, logger: slog.Default(),
 		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]teamRateLimitObservation),
-		modelSyncing: make(map[uint64]struct{}),
+		modelSyncing:       make(map[uint64]struct{}),
+		shadowQualitySlots: make(chan struct{}, defaultQualityHedgeMaxShadowProbes),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
+}
+
+// WaitShadowQualityProbes 等待所有后台影子质检协程退出，主要用于单测或优雅停机收尾。
+func (s *Service) WaitShadowQualityProbes() {
+	s.shadowQualityWG.Wait()
+}
+
+func (s *Service) tryAcquireShadowQualitySlot() bool {
+	if s.shadowQualitySlots == nil {
+		return false
+	}
+	select {
+	case s.shadowQualitySlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseShadowQualitySlot() {
+	if s.shadowQualitySlots == nil {
+		return
+	}
+	select {
+	case <-s.shadowQualitySlots:
+	default:
+	}
 }
 
 // UpdateBuildForbiddenReauthPolicy atomically replaces the Build account invalidation policy.
@@ -1075,7 +1105,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timing.markCredential(time.Since(started))
 		return result, err
 	}
-	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time) *Result {
+	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, activeTrace *infraegress.Trace) *Result {
 		accountID := credential.ID
 		var once sync.Once
 		finalize := func(usage Usage, responseID, errorCode string) {
@@ -1139,7 +1169,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 					record.Attempts = attempts
 				}
 				record.CreatedAt = now
-				applyAuditEgress(&record, egressTrace, route.Provider)
+				traceForAudit := activeTrace
+				if traceForAudit == nil {
+					traceForAudit = egressTrace
+				}
+				applyAuditEgress(&record, traceForAudit, route.Provider)
 				if err := budget.run("quality_disable", finalizationHealthBudget, func(stageCtx context.Context) error {
 					return s.applyOutputSpeedPenalty(stageCtx, record, credential, holdCfg, input.ForcedEgressNodeID != 0)
 				}); err != nil {
@@ -1228,6 +1262,28 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		}
 		_ = fallback.response.Body.Close()
 		fallback = nil
+	}
+	if shouldHedgeQualityStream(input, ownership, qualityHoldEnabled, qualityCrossAccountReplay, attemptPolicy, holdCfg) {
+		return s.createHedgedResponse(ctx, hedgeResponseParams{
+			input:              input,
+			path:               path,
+			route:              route,
+			operation:          operation,
+			adapter:            adapter,
+			accountScope:       accountScope,
+			quotaMode:          quotaMode,
+			affinityKey:        affinityKey,
+			reasoningReplayKey: reasoningReplayKey,
+			selection:          selection,
+			attemptPolicy:      attemptPolicy,
+			holdCfg:            holdCfg,
+			auditBase:          &auditBase,
+			startedAt:          startedAt,
+			egressTrace:        egressTrace,
+			failureAttempts:    failureAttempts,
+			timing:             timing,
+			handoffResponse:    handoffResponse,
+		})
 	}
 attemptLoop:
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
@@ -1722,16 +1778,16 @@ attemptLoop:
 			selected := fallback
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", append([]any{"request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts}, qualityDiagnosticLogAttrs(selected.diagnostic)...)...)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
+			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, egressTrace), nil
 		}
-		return handoffResponse(response, lease, credential, responseStartedAt), nil
+		return handoffResponse(response, lease, credential, responseStartedAt, egressTrace), nil
 	}
 	if fallback != nil {
 		if ctx.Err() == nil && holdCfg.OnExhausted == qualityRetryFailOpen {
 			selected := fallback
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", append([]any{"request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts}, qualityDiagnosticLogAttrs(selected.diagnostic)...)...)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
+			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, egressTrace), nil
 		}
 		discardFallback(true)
 	}

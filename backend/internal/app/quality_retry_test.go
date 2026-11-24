@@ -75,3 +75,15 @@ func TestDegradedAccountSwitchAppliesAndRestoresRequestRetryPolicy(t *testing.T)
 		})
 	}
 }
+
+func TestQualityHedgeSwitchEnablesRequestRetryRuntime(t *testing.T) {
+	cfg := config.Config{}
+	cfg.QualityGuard.RequestRetry.HedgeEnabled = true
+	cfg.QualityGuard.RequestRetry.HedgeDelay = config.Duration(8 * time.Second)
+	cfg.QualityGuard.RequestRetry.HedgeMaxConcurrent = 2
+
+	rt := qualityRetryRuntime(cfg.QualityGuard)
+	if !rt.Enabled || !rt.HedgeEnabled || rt.HedgeDelay != 8*time.Second || rt.HedgeMaxConcurrent != 2 {
+		t.Fatalf("unexpected hedge runtime: %#v", rt)
+	}
+}

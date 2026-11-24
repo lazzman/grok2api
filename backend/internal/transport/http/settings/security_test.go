@@ -152,7 +152,7 @@ func TestLegacySettingsRequestPreservesBuildForbiddenCodesWhenOmitted(t *testing
 		t.Fatal(err)
 	}
 	input := dto.toApplication()
-	if !input.AccountsProvided || !input.Accounts.MarkBuildForbiddenReauthProvided || input.Accounts.BuildForbiddenReauthCodesProvided || input.Accounts.AutoDisableDegradedAccountsProvided {
+	if !input.AccountsProvided || !input.Accounts.MarkBuildForbiddenReauthProvided || input.Accounts.BuildForbiddenReauthCodesProvided || input.Accounts.AutoDisableDegradedAccountsProvided || input.Accounts.QualityHedgeEnabledProvided || input.Accounts.QualityHedgeDelayProvided || input.Accounts.QualityHedgeMaxConcurrentProvided {
 		t.Fatalf("legacy field presence was not preserved: %#v", input.Accounts)
 	}
 }

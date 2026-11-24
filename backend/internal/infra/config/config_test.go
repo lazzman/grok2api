@@ -226,7 +226,7 @@ qualityGuard:
 func TestDefaultQualityGuardRequestRetryContract(t *testing.T) {
 	t.Parallel()
 	got := defaultConfig().QualityGuard.RequestRetry
-	if got.Enabled || got.AutoDisable || got.MaxAttempts != 6 || got.HoldTimeout.Value() != 30*time.Second || got.MinOutputTokens != 8 || got.OnExhausted != "fail_closed" || got.AccountCooldown.Value() != 12*time.Hour || got.IdleAccountCooldown.Value() != 15*time.Minute || got.MinEncryptedBytes != 256 || got.EncryptedBytesPerReasoningToken != 4 {
+	if got.Enabled || got.AutoDisable || got.MaxAttempts != 6 || got.HoldTimeout.Value() != 30*time.Second || got.MinOutputTokens != 8 || got.OnExhausted != "fail_closed" || got.AccountCooldown.Value() != 12*time.Hour || got.IdleAccountCooldown.Value() != 15*time.Minute || got.MinEncryptedBytes != 256 || got.EncryptedBytesPerReasoningToken != 4 || got.HedgeEnabled || got.HedgeDelay.Value() != 8*time.Second || got.HedgeMaxConcurrent != 2 {
 		t.Fatalf("requestRetry defaults = %#v", got)
 	}
 }
@@ -248,6 +248,10 @@ func TestAutoDisableValidatesRequestPolicyWithoutSidecar(t *testing.T) {
 		{"soft TPS", func(c *QualityGuardConfig) { c.SoftTPS = 0 }},
 		{"hard TPS", func(c *QualityGuardConfig) { c.HardTPS = c.SoftTPS }},
 		{"generation window", func(c *QualityGuardConfig) { c.MinimumGenerationWindow = 0 }},
+		{"hedge delay too small", func(c *QualityGuardConfig) { c.RequestRetry.HedgeDelay = Duration(500 * time.Millisecond) }},
+		{"hedge delay too large", func(c *QualityGuardConfig) { c.RequestRetry.HedgeDelay = Duration(31 * time.Second) }},
+		{"hedge max concurrent too small", func(c *QualityGuardConfig) { c.RequestRetry.HedgeMaxConcurrent = 1 }},
+		{"hedge max concurrent too large", func(c *QualityGuardConfig) { c.RequestRetry.HedgeMaxConcurrent = 7 }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := base

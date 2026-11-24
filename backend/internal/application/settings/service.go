@@ -141,6 +141,9 @@ type ClientKeyDefaultsConfig struct {
 // AccountsConfig 是管理接口使用的账号池维护策略输入。
 type AccountsConfig struct {
 	AutoDisableDegradedAccounts bool
+	QualityHedgeEnabled         bool
+	QualityHedgeDelay           string
+	QualityHedgeMaxConcurrent   int
 	MarkBuildForbiddenReauth    bool
 	BuildForbiddenReauthCodes   []string
 	// ExcludeBuildBotFlaggedFromScheduling drops bot-risk Build accounts from scheduling only.
@@ -159,6 +162,9 @@ type AccountsConfig struct {
 	AutoDeleteConsoleUnlinkedProvided            bool
 	// AutoDisableDegradedAccountsProvided preserves config.yaml when an older management client omits the field.
 	AutoDisableDegradedAccountsProvided bool
+	QualityHedgeEnabledProvided         bool
+	QualityHedgeDelayProvided           bool
+	QualityHedgeMaxConcurrentProvided   bool
 }
 
 // EditableConfig 聚合管理端允许修改的运行参数。
@@ -459,6 +465,15 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	if value.Accounts.AutoDisableDegradedAccounts != nil {
 		base.QualityGuard.RequestRetry.AutoDisable = *value.Accounts.AutoDisableDegradedAccounts
 	}
+	if value.Accounts.QualityHedgeEnabled != nil {
+		base.QualityGuard.RequestRetry.HedgeEnabled = *value.Accounts.QualityHedgeEnabled
+	}
+	if value.Accounts.QualityHedgeDelay != nil && *value.Accounts.QualityHedgeDelay > 0 {
+		base.QualityGuard.RequestRetry.HedgeDelay = config.Duration(*value.Accounts.QualityHedgeDelay)
+	}
+	if value.Accounts.QualityHedgeMaxConcurrent != nil && *value.Accounts.QualityHedgeMaxConcurrent > 0 {
+		base.QualityGuard.RequestRetry.HedgeMaxConcurrent = *value.Accounts.QualityHedgeMaxConcurrent
+	}
 	return base
 }
 
@@ -466,6 +481,15 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 	randomDelay := value.Batch.RandomDelay.Value()
 	accountIsolatedConnections := value.Routing.AccountIsolatedConnections
 	autoDisableDegradedAccounts := value.QualityGuard.RequestRetry.AutoDisable
+	qualityHedgeEnabled := value.QualityGuard.RequestRetry.HedgeEnabled
+	qualityHedgeDelay := value.QualityGuard.RequestRetry.HedgeDelay.Value()
+	if qualityHedgeDelay <= 0 {
+		qualityHedgeDelay = 8 * time.Second
+	}
+	qualityHedgeMaxConcurrent := value.QualityGuard.RequestRetry.HedgeMaxConcurrent
+	if qualityHedgeMaxConcurrent <= 0 {
+		qualityHedgeMaxConcurrent = 2
+	}
 	return settingsdomain.Config{
 		Server: settingsdomain.ServerConfig{MaxConcurrentRequests: value.Server.MaxConcurrentRequests},
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
@@ -525,6 +549,9 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 		},
 		Accounts: settingsdomain.AccountsConfig{
 			AutoDisableDegradedAccounts:          &autoDisableDegradedAccounts,
+			QualityHedgeEnabled:                  &qualityHedgeEnabled,
+			QualityHedgeDelay:                    &qualityHedgeDelay,
+			QualityHedgeMaxConcurrent:            &qualityHedgeMaxConcurrent,
 			MarkBuildForbiddenReauth:             value.Accounts.MarkBuildForbiddenReauth,
 			BuildForbiddenReauthCodes:            append([]string(nil), value.Accounts.BuildForbiddenReauthCodes...),
 			ExcludeBuildBotFlaggedFromScheduling: value.Accounts.ExcludeBuildBotFlaggedFromScheduling,
@@ -635,6 +662,12 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		if input.Accounts.AutoDisableDegradedAccountsProvided {
 			next.QualityGuard.RequestRetry.AutoDisable = input.Accounts.AutoDisableDegradedAccounts
 		}
+		if input.Accounts.QualityHedgeEnabledProvided {
+			next.QualityGuard.RequestRetry.HedgeEnabled = input.Accounts.QualityHedgeEnabled
+		}
+		if input.Accounts.QualityHedgeMaxConcurrentProvided {
+			next.QualityGuard.RequestRetry.HedgeMaxConcurrent = input.Accounts.QualityHedgeMaxConcurrent
+		}
 		if input.Accounts.MarkBuildForbiddenReauthProvided {
 			next.Accounts.MarkBuildForbiddenReauth = input.Accounts.MarkBuildForbiddenReauth
 		}
@@ -695,6 +728,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 			durationInput{"accounts.autoCleanReauthInterval", input.Accounts.AutoCleanReauthInterval, func(value config.Duration) { next.Accounts.AutoCleanReauthInterval = value }},
 			durationInput{"accounts.autoCleanReauthMinAge", input.Accounts.AutoCleanReauthMinAge, func(value config.Duration) { next.Accounts.AutoCleanReauthMinAge = value }},
 		)
+		if input.Accounts.QualityHedgeDelayProvided {
+			durations = append(durations, durationInput{"accounts.qualityHedgeDelay", input.Accounts.QualityHedgeDelay, func(value config.Duration) { next.QualityGuard.RequestRetry.HedgeDelay = value }})
+		}
 	}
 	for _, item := range durations {
 		value, err := time.ParseDuration(strings.TrimSpace(item.value))
@@ -782,6 +818,12 @@ func toEditable(cfg config.Config) EditableConfig {
 		Accounts: AccountsConfig{
 			AutoDisableDegradedAccounts:                  cfg.QualityGuard.RequestRetry.AutoDisable,
 			AutoDisableDegradedAccountsProvided:          true,
+			QualityHedgeEnabled:                          cfg.QualityGuard.RequestRetry.HedgeEnabled,
+			QualityHedgeEnabledProvided:                  true,
+			QualityHedgeDelay:                            formatQualityHedgeDelay(cfg.QualityGuard.RequestRetry.HedgeDelay),
+			QualityHedgeDelayProvided:                    true,
+			QualityHedgeMaxConcurrent:                    normalizeQualityHedgeMaxConcurrent(cfg.QualityGuard.RequestRetry.HedgeMaxConcurrent),
+			QualityHedgeMaxConcurrentProvided:            true,
 			MarkBuildForbiddenReauth:                     cfg.Accounts.MarkBuildForbiddenReauth,
 			BuildForbiddenReauthCodes:                    append([]string(nil), cfg.Accounts.BuildForbiddenReauthCodes...),
 			ExcludeBuildBotFlaggedFromScheduling:         cfg.Accounts.ExcludeBuildBotFlaggedFromScheduling,
@@ -797,6 +839,20 @@ func toEditable(cfg config.Config) EditableConfig {
 		},
 		AccountsProvided: true,
 	}
+}
+
+func formatQualityHedgeDelay(value config.Duration) string {
+	if value.Value() <= 0 {
+		return (8 * time.Second).String()
+	}
+	return value.String()
+}
+
+func normalizeQualityHedgeMaxConcurrent(value int) int {
+	if value <= 0 {
+		return 2
+	}
+	return value
 }
 
 func normalizeForbiddenCodes(values []string) []string {

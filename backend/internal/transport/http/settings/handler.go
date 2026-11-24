@@ -133,6 +133,9 @@ type clientKeyDefaultsConfigDTO struct {
 
 type accountsConfigDTO struct {
 	AutoDisableDegradedAccounts          *bool     `json:"autoDisableDegradedAccounts,omitempty"`
+	QualityHedgeEnabled                  *bool     `json:"qualityHedgeEnabled,omitempty"`
+	QualityHedgeDelay                    *string   `json:"qualityHedgeDelay,omitempty"`
+	QualityHedgeMaxConcurrent            *int      `json:"qualityHedgeMaxConcurrent,omitempty"`
 	MarkBuildForbiddenReauth             *bool     `json:"markBuildForbiddenReauth,omitempty"`
 	BuildForbiddenReauthCodes            *[]string `json:"buildForbiddenReauthCodes,omitempty"`
 	ExcludeBuildBotFlaggedFromScheduling *bool     `json:"excludeBuildBotFlaggedFromScheduling,omitempty"`
@@ -261,6 +264,12 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 		result.Accounts = settingsapp.AccountsConfig{
 			AutoDisableDegradedAccounts:                  boolValue(value.Accounts.AutoDisableDegradedAccounts),
 			AutoDisableDegradedAccountsProvided:          value.Accounts.AutoDisableDegradedAccounts != nil,
+			QualityHedgeEnabled:                          boolValue(value.Accounts.QualityHedgeEnabled),
+			QualityHedgeEnabledProvided:                  value.Accounts.QualityHedgeEnabled != nil,
+			QualityHedgeDelay:                            optionalString(value.Accounts.QualityHedgeDelay),
+			QualityHedgeDelayProvided:                    value.Accounts.QualityHedgeDelay != nil,
+			QualityHedgeMaxConcurrent:                    intValue(value.Accounts.QualityHedgeMaxConcurrent),
+			QualityHedgeMaxConcurrentProvided:            value.Accounts.QualityHedgeMaxConcurrent != nil,
 			MarkBuildForbiddenReauth:                     boolValue(value.Accounts.MarkBuildForbiddenReauth),
 			BuildForbiddenReauthCodes:                    stringSliceValue(value.Accounts.BuildForbiddenReauthCodes),
 			ExcludeBuildBotFlaggedFromScheduling:         boolValue(value.Accounts.ExcludeBuildBotFlaggedFromScheduling),
@@ -342,6 +351,9 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 			},
 			Accounts: &accountsConfigDTO{
 				AutoDisableDegradedAccounts:          boolPointer(config.Accounts.AutoDisableDegradedAccounts),
+				QualityHedgeEnabled:                  boolPointer(config.Accounts.QualityHedgeEnabled),
+				QualityHedgeDelay:                    stringPointer(config.Accounts.QualityHedgeDelay),
+				QualityHedgeMaxConcurrent:            intPointer(config.Accounts.QualityHedgeMaxConcurrent),
 				MarkBuildForbiddenReauth:             boolPointer(config.Accounts.MarkBuildForbiddenReauth),
 				BuildForbiddenReauthCodes:            stringSlicePointer(config.Accounts.BuildForbiddenReauthCodes),
 				ExcludeBuildBotFlaggedFromScheduling: boolPointer(config.Accounts.ExcludeBuildBotFlaggedFromScheduling),

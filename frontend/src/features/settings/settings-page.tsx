@@ -30,6 +30,7 @@ export function SettingsPage() {
   const limitedVideoRoutingAttemptsRef = useRef(999);
   const autoCleanEnabled = form.watch("accounts.autoCleanReauthEnabled") === true;
   const buildForbiddenReauthEnabled = form.watch("accounts.markBuildForbiddenReauth") === true;
+  const qualityHedgeEnabled = form.watch("accounts.qualityHedgeEnabled") === true;
   const segmentedSelectorEnabled = form.watch("routing.segmentedSelector.enabled") === true;
 
   if (settingsQuery.isError) {
@@ -444,6 +445,42 @@ export function SettingsPage() {
                       <Switch id="accounts-auto-disable-degraded" checked={Boolean(field.value)} onCheckedChange={field.onChange} />
                     </div>
                   )} />
+                </SettingsField>
+                <SettingsField controlId="accounts-quality-hedge-enabled" label={t("settings.accounts.qualityHedgeEnabled")} description={t("settings.accounts.qualityHedgeEnabledHelp")}>
+                  <Controller control={form.control} name="accounts.qualityHedgeEnabled" render={({ field }) => (
+                    <div className="flex h-9 items-center">
+                      <Switch id="accounts-quality-hedge-enabled" checked={Boolean(field.value)} onCheckedChange={field.onChange} />
+                    </div>
+                  )} />
+                </SettingsField>
+                <SettingsField
+                  controlId="accounts-quality-hedge-delay"
+                  label={t("settings.accounts.qualityHedgeDelay")}
+                  description={t("settings.accounts.qualityHedgeDelayHelp")}
+                  error={form.formState.errors.accounts?.qualityHedgeDelay?.message}
+                >
+                  <Controller
+                    control={form.control}
+                    name="accounts.qualityHedgeDelay"
+                    render={({ field }) => (
+                      <DurationInput id="accounts-quality-hedge-delay" value={field.value} onChange={field.onChange} disabled={!qualityHedgeEnabled} />
+                    )}
+                  />
+                </SettingsField>
+                <SettingsField
+                  controlId="accounts-quality-hedge-max-concurrent"
+                  label={t("settings.accounts.qualityHedgeMaxConcurrent")}
+                  description={t("settings.accounts.qualityHedgeMaxConcurrentHelp")}
+                  error={form.formState.errors.accounts?.qualityHedgeMaxConcurrent?.message}
+                >
+                  <Input
+                    id="accounts-quality-hedge-max-concurrent"
+                    type="number"
+                    min={2}
+                    max={6}
+                    disabled={!qualityHedgeEnabled}
+                    {...form.register("accounts.qualityHedgeMaxConcurrent", { valueAsNumber: true })}
+                  />
                 </SettingsField>
               </div>
             </SettingsSection>

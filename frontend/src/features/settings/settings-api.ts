@@ -28,6 +28,9 @@ export type SettingsConfigDTO = {
   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
   accounts: {
     autoDisableDegradedAccounts: boolean;
+    qualityHedgeEnabled: boolean;
+    qualityHedgeDelay: string;
+    qualityHedgeMaxConcurrent: number;
     markBuildForbiddenReauth: boolean;
     buildForbiddenReauthCodes: string[];
     excludeBuildBotFlaggedFromScheduling: boolean;
@@ -142,6 +145,9 @@ const settingsConfigValidator = hasShape({
   // Older backends may omit accounts; withSettingsDefaults supplies a safe local default.
   accounts: isOptional(hasShape({
     autoDisableDegradedAccounts: isOptional(isBoolean),
+    qualityHedgeEnabled: isOptional(isBoolean),
+    qualityHedgeDelay: isOptional(isString),
+    qualityHedgeMaxConcurrent: isOptional(isNumber),
     markBuildForbiddenReauth: isOptional(isBoolean),
     buildForbiddenReauthCodes: isOptional(isArrayOf(isString)),
     excludeBuildBotFlaggedFromScheduling: isOptional(isBoolean),
@@ -154,6 +160,9 @@ const settingsConfigValidator = hasShape({
 });
 const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
   autoDisableDegradedAccounts: false,
+  qualityHedgeEnabled: false,
+  qualityHedgeDelay: "8s",
+  qualityHedgeMaxConcurrent: 2,
   markBuildForbiddenReauth: false,
   buildForbiddenReauthCodes: ["permission-denied"],
   excludeBuildBotFlaggedFromScheduling: false,
@@ -195,6 +204,9 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
       },
       accounts: {
         autoDisableDegradedAccounts: accounts.autoDisableDegradedAccounts ?? false,
+        qualityHedgeEnabled: accounts.qualityHedgeEnabled ?? false,
+        qualityHedgeDelay: accounts.qualityHedgeDelay || "8s",
+        qualityHedgeMaxConcurrent: accounts.qualityHedgeMaxConcurrent || 2,
         markBuildForbiddenReauth: accounts.markBuildForbiddenReauth ?? false,
         buildForbiddenReauthCodes: accounts.buildForbiddenReauthCodes ?? ["permission-denied"],
         excludeBuildBotFlaggedFromScheduling: accounts.excludeBuildBotFlaggedFromScheduling ?? false,

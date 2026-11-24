@@ -501,10 +501,8 @@ func accountAutoCleanConfig(value config.AccountsConfig) accountapp.AutoCleanCon
 func qualityRetryRuntime(value config.QualityGuardConfig) gateway.QualityRetryRuntime {
 	retry := value.RequestRetry
 	return gateway.QualityRetryRuntime{
-		// Auto-disable needs request-path detection even when the YAML retry
-		// switch is off. Derive this at runtime so turning auto-disable off
-		// restores the original policy without persisting a second switch.
-		Enabled:                         retry.Enabled || retry.AutoDisable,
+		// 自动停用或分时并发均依赖请求内质量闸门；在运行时推导 Enabled，关闭后可无损恢复原有 YAML 策略。
+		Enabled:                         retry.Enabled || retry.AutoDisable || retry.HedgeEnabled,
 		MaxAttempts:                     retry.MaxAttempts,
 		HoldTimeout:                     retry.HoldTimeout.Value(),
 		MinOutputTokens:                 int64(retry.MinOutputTokens),
@@ -514,6 +512,9 @@ func qualityRetryRuntime(value config.QualityGuardConfig) gateway.QualityRetryRu
 		IdleAccountCooldown:             retry.IdleAccountCooldown.Value(),
 		MinEncryptedBytes:               retry.MinEncryptedBytes,
 		EncryptedBytesPerReasoningToken: retry.EncryptedBytesPerReasoningToken,
+		HedgeEnabled:                    retry.HedgeEnabled,
+		HedgeDelay:                      retry.HedgeDelay.Value(),
+		HedgeMaxConcurrent:              retry.HedgeMaxConcurrent,
 		SoftTPS:                         value.SoftTPS,
 		HardTPS:                         value.HardTPS,
 		MinGenerationMS:                 value.MinimumGenerationWindow.Value().Milliseconds(),

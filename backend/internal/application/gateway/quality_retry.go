@@ -35,6 +35,10 @@ const (
 	// An empty stream that idles while held is treated as an account-quality
 	// failure: the request can still rotate before any bytes reach the client.
 	qualityIdleAccountCooldown = 15 * time.Minute
+	// 分时并发默认参数与全局后台影子质检并发上限。
+	defaultQualityHedgeDelay           = 8 * time.Second
+	defaultQualityHedgeMaxConcurrent   = 2
+	defaultQualityHedgeMaxShadowProbes = 8
 )
 
 var (
@@ -57,6 +61,9 @@ type QualityRetryRuntime struct {
 	IdleAccountCooldown             time.Duration
 	MinEncryptedBytes               int
 	EncryptedBytesPerReasoningToken int
+	HedgeEnabled                    bool
+	HedgeDelay                      time.Duration
+	HedgeMaxConcurrent              int
 	SoftTPS                         float64
 	HardTPS                         float64
 	MinGenerationMS                 int64
@@ -146,6 +153,12 @@ func normalizeQualityRetry(cfg QualityRetryRuntime) QualityRetryRuntime {
 	}
 	if cfg.EncryptedBytesPerReasoningToken <= 0 {
 		cfg.EncryptedBytesPerReasoningToken = defaultEncryptedBytesPerReasoningToken
+	}
+	if cfg.HedgeDelay <= 0 {
+		cfg.HedgeDelay = defaultQualityHedgeDelay
+	}
+	if cfg.HedgeMaxConcurrent <= 0 {
+		cfg.HedgeMaxConcurrent = defaultQualityHedgeMaxConcurrent
 	}
 	if cfg.SoftTPS <= 0 {
 		cfg.SoftTPS = audit.DefaultDegradeSoftTPS
@@ -456,6 +469,20 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 // on another account.
 func canReplayQualityHoldAcrossAccounts(input Input, ownership *inferencedomain.ResponseOwnership) bool {
 	return ownership == nil && !qualityRequestHasReplayUnsafeHostedTools(input.Body)
+}
+
+// shouldHedgeQualityStream 判断当前请求是否满足多账号分时并发竞速的安全准入边界。
+func shouldHedgeQualityStream(input Input, ownership *inferencedomain.ResponseOwnership, qualityHoldEnabled, qualityCrossAccountReplay bool, attemptPolicy routingAttemptPolicy, cfg QualityRetryRuntime) bool {
+	if !qualityHoldEnabled || !qualityCrossAccountReplay || !cfg.HedgeEnabled {
+		return false
+	}
+	if ownership != nil || input.ForcedAccountID != 0 || input.ForcedEgressNodeID != 0 {
+		return false
+	}
+	if cfg.HedgeMaxConcurrent < 2 || cfg.MaxAttempts < 2 {
+		return false
+	}
+	return attemptPolicy.allows(1)
 }
 
 func qualityRequestHasReplayUnsafeHostedTools(body []byte) bool {

@@ -154,6 +154,68 @@ func (session *selectionSession) Acquire(ctx context.Context, excluded map[uint6
 	return session.acquireNormal(ctx, excluded)
 }
 
+// AcquirePreferringDifferent 在分时并发拉起后续分支时优先避开与在飞分支相同的团队和代理出口；
+// 若号池中没有满足避让条件的可用候选，则无缝回退到常规 Acquire，且不破坏原有候选计划。
+func (session *selectionSession) AcquirePreferringDifferent(
+	ctx context.Context,
+	excluded map[uint64]bool,
+	allowQuotaProbe bool,
+	avoidTeams map[string]bool,
+	avoidEgressNodes map[uint64]bool,
+) (*accountLease, error) {
+	if len(avoidTeams) > 0 || len(avoidEgressNodes) > 0 {
+		preferredExcluded := make(map[uint64]bool, len(excluded)+len(session.values))
+		for id, blocked := range excluded {
+			if blocked {
+				preferredExcluded[id] = true
+			}
+		}
+		for _, candidate := range session.values {
+			cred := candidate.Credential
+			if preferredExcluded[cred.ID] {
+				continue
+			}
+			if (cred.TeamID != "" && avoidTeams[cred.TeamID]) || (cred.EgressNodeID != 0 && avoidEgressNodes[cred.EgressNodeID]) {
+				preferredExcluded[cred.ID] = true
+			}
+		}
+		if lease, err := session.tryAcquirePreferredNormal(ctx, preferredExcluded); err != nil {
+			return nil, err
+		} else if lease != nil {
+			return lease, nil
+		}
+	}
+	return session.Acquire(ctx, excluded, allowQuotaProbe)
+}
+
+func (session *selectionSession) tryAcquirePreferredNormal(ctx context.Context, preferredExcluded map[uint64]bool) (*accountLease, error) {
+	indexes := session.unexcludedNormalIndexes(preferredExcluded)
+	if len(indexes) == 0 {
+		return nil, nil
+	}
+	plan, err := session.selector.planCandidateIndexes(ctx, session.values, indexes, time.Now().UTC(), session.selector.resolveTierOrder(session.provider, session.upstreamModel, session.quotaMode))
+	if err != nil {
+		return nil, err
+	}
+	for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
+		if session.candidateExcluded(preferredExcluded, candidate.Credential.ID) {
+			continue
+		}
+		lease, err := session.selector.claimAccountSlotTracked(ctx, candidate.Credential, &session.materialFailures)
+		if err != nil {
+			if errors.Is(err, errRoutingCredentialStale) {
+				session.markCandidateStale(candidate.Credential.ID)
+				continue
+			}
+			return nil, err
+		}
+		if lease != nil {
+			return session.completeNormalLease(ctx, lease, candidate, preferredExcluded)
+		}
+	}
+	return nil, nil
+}
+
 // RetryAccount 将一个已被本请求取出的普通账号放回下一次选号的最前面。
 // 仅用于出口重建后的无账号归因重试，不能用于账号级失败。
 func (session *selectionSession) RetryAccount(accountID uint64) {

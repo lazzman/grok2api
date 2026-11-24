@@ -164,6 +164,12 @@ export const settingsSchema = z.object({
   clientKeyDefaults: z.object({ rpmLimit: positiveInteger.max(100_000), maxConcurrent: positiveInteger.max(1_024) }),
   accounts: z.object({
     autoDisableDegradedAccounts: z.boolean(),
+    qualityHedgeEnabled: z.boolean(),
+    qualityHedgeDelay: durationSchema.refine((value) => {
+      const seconds = durationSeconds(value);
+      return seconds >= 1 && seconds <= 30;
+    }),
+    qualityHedgeMaxConcurrent: z.number().int().min(2).max(6),
     markBuildForbiddenReauth: z.boolean(),
     buildForbiddenReauthCodes: z.string().superRefine((value, context) => {
       const codes = parseForbiddenCodes(value);
@@ -229,6 +235,9 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
     clientKeyDefaults: config.clientKeyDefaults,
     accounts: {
       autoDisableDegradedAccounts: config.accounts.autoDisableDegradedAccounts,
+      qualityHedgeEnabled: config.accounts.qualityHedgeEnabled,
+      qualityHedgeDelay: parseDuration(config.accounts.qualityHedgeDelay || "8s"),
+      qualityHedgeMaxConcurrent: config.accounts.qualityHedgeMaxConcurrent || 2,
       markBuildForbiddenReauth: config.accounts.markBuildForbiddenReauth,
       buildForbiddenReauthCodes: config.accounts.buildForbiddenReauthCodes.join("\n"),
       excludeBuildBotFlaggedFromScheduling: config.accounts.excludeBuildBotFlaggedFromScheduling,
@@ -280,6 +289,9 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
     clientKeyDefaults: config.clientKeyDefaults,
     accounts: {
       autoDisableDegradedAccounts: config.accounts.autoDisableDegradedAccounts,
+      qualityHedgeEnabled: config.accounts.qualityHedgeEnabled,
+      qualityHedgeDelay: formatDuration(config.accounts.qualityHedgeDelay),
+      qualityHedgeMaxConcurrent: config.accounts.qualityHedgeMaxConcurrent,
       markBuildForbiddenReauth: config.accounts.markBuildForbiddenReauth,
       buildForbiddenReauthCodes: parseForbiddenCodes(config.accounts.buildForbiddenReauthCodes),
       excludeBuildBotFlaggedFromScheduling: config.accounts.excludeBuildBotFlaggedFromScheduling,

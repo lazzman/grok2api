@@ -871,6 +871,61 @@ func TestUpdateAutoDisableDegradedAccountsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUpdateQualityHedgeSettingsRoundTrip(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.QualityGuard.RequestRetry.HedgeEnabled = false
+	cfg.QualityGuard.RequestRetry.HedgeDelay = config.Duration(8 * time.Second)
+	cfg.QualityGuard.RequestRetry.HedgeMaxConcurrent = 2
+	repo := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repo, nil, func(next config.Config) { applied = next })
+
+	input := service.Get().Config
+	if input.Accounts.QualityHedgeEnabled || input.Accounts.QualityHedgeDelay != "8s" || input.Accounts.QualityHedgeMaxConcurrent != 2 {
+		t.Fatalf("unexpected default hedge settings: %#v", input.Accounts)
+	}
+	input.Accounts.QualityHedgeEnabled = true
+	input.Accounts.QualityHedgeEnabledProvided = true
+	input.Accounts.QualityHedgeDelay = "6s"
+	input.Accounts.QualityHedgeDelayProvided = true
+	input.Accounts.QualityHedgeMaxConcurrent = 3
+	input.Accounts.QualityHedgeMaxConcurrentProvided = true
+
+	snapshot, err := service.Update(context.Background(), 0, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied.QualityGuard.RequestRetry.HedgeEnabled || applied.QualityGuard.RequestRetry.HedgeDelay.Value() != 6*time.Second || applied.QualityGuard.RequestRetry.HedgeMaxConcurrent != 3 {
+		t.Fatalf("hedge config not applied: %#v", applied.QualityGuard.RequestRetry)
+	}
+	if !snapshot.Config.Accounts.QualityHedgeEnabled || snapshot.Config.Accounts.QualityHedgeDelay != "6s" || snapshot.Config.Accounts.QualityHedgeMaxConcurrent != 3 {
+		t.Fatalf("hedge snapshot mismatch: %#v", snapshot.Config.Accounts)
+	}
+	reloaded, _, _, err := LoadPersisted(context.Background(), cfg, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.QualityGuard.RequestRetry.HedgeEnabled || reloaded.QualityGuard.RequestRetry.HedgeDelay.Value() != 6*time.Second || reloaded.QualityGuard.RequestRetry.HedgeMaxConcurrent != 3 {
+		t.Fatalf("reloaded hedge config mismatch: %#v", reloaded.QualityGuard.RequestRetry)
+	}
+
+	// 验证旧版管理端不传 hedge 字段时不会覆盖当前配置。
+	legacy := toDomainConfig(reloaded)
+	legacy.Accounts.QualityHedgeEnabled = nil
+	legacy.Accounts.QualityHedgeDelay = nil
+	legacy.Accounts.QualityHedgeMaxConcurrent = nil
+	cfg.QualityGuard.RequestRetry.HedgeEnabled = true
+	cfg.QualityGuard.RequestRetry.HedgeDelay = config.Duration(10 * time.Second)
+	cfg.QualityGuard.RequestRetry.HedgeMaxConcurrent = 3
+	kept, _, _, err := LoadPersisted(context.Background(), cfg, &runtimeSettingsRepositoryStub{value: legacy, found: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !kept.QualityGuard.RequestRetry.HedgeEnabled || kept.QualityGuard.RequestRetry.HedgeDelay.Value() != 10*time.Second || kept.QualityGuard.RequestRetry.HedgeMaxConcurrent != 3 {
+		t.Fatalf("legacy payload overrode yaml hedge config: %#v", kept.QualityGuard.RequestRetry)
+	}
+}
+
 func TestLoadPersistedKeepsYAMLAutoDisableForOlderPayload(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.QualityGuard.RequestRetry.AutoDisable = true

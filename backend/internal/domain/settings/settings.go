@@ -154,6 +154,12 @@ type AccountsConfig struct {
 	// AutoDisableDegradedAccounts is optional so legacy persisted settings keep
 	// the qualityGuard.requestRetry.autoDisable value supplied by config.yaml.
 	AutoDisableDegradedAccounts *bool
+	// QualityHedgeEnabled 开启流式推理多账号分时并发竞速，可选以兼容历史持久化记录。
+	QualityHedgeEnabled *bool
+	// QualityHedgeDelay 分时并发延迟，可选以兼容历史持久化记录。
+	QualityHedgeDelay *time.Duration
+	// QualityHedgeMaxConcurrent 分时并发最大同时在飞账号数，可选以兼容历史持久化记录。
+	QualityHedgeMaxConcurrent *int
 	// MarkBuildForbiddenReauth marks high-confidence Grok Build permission denials as requiring reauthorization.
 	MarkBuildForbiddenReauth bool
 	// BuildForbiddenReauthCodes contains exact upstream error codes that opt into account invalidation.

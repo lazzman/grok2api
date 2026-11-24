@@ -308,6 +308,12 @@ type QualityGuardRequestRetryConfig struct {
 	IdleAccountCooldown             Duration `yaml:"idleAccountCooldown"`
 	MinEncryptedBytes               int      `yaml:"minEncryptedBytes"`
 	EncryptedBytesPerReasoningToken int      `yaml:"encryptedBytesPerReasoningToken"`
+	// HedgeEnabled 开启流式推理多账号分时并发竞速，败者转后台影子质检。
+	HedgeEnabled bool `yaml:"hedgeEnabled"`
+	// HedgeDelay 分时并发延迟；首路在此时间内未通过质量闸门时拉起下一路，默认 8s。
+	HedgeDelay Duration `yaml:"hedgeDelay"`
+	// HedgeMaxConcurrent 单请求分时并发的最大同时在飞账号数，默认 2。
+	HedgeMaxConcurrent int `yaml:"hedgeMaxConcurrent"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -803,7 +809,7 @@ func validateQualityGuardConfig(value QualityGuardConfig) error {
 }
 
 func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) error {
-	if !value.Enabled && !value.AutoDisable {
+	if !value.Enabled && !value.AutoDisable && !value.HedgeEnabled {
 		return nil
 	}
 	if value.MaxAttempts != 0 && (value.MaxAttempts < 1 || value.MaxAttempts > 6) {
@@ -831,6 +837,12 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 	}
 	if value.EncryptedBytesPerReasoningToken != 0 && (value.EncryptedBytesPerReasoningToken < 1 || value.EncryptedBytesPerReasoningToken > 16) {
 		return errors.New("qualityGuard.requestRetry.encryptedBytesPerReasoningToken 必须在 1 到 16 之间")
+	}
+	if d := value.HedgeDelay.Value(); d != 0 && (d < time.Second || d > 30*time.Second) {
+		return errors.New("qualityGuard.requestRetry.hedgeDelay 必须在 1s 到 30s 之间")
+	}
+	if value.HedgeMaxConcurrent != 0 && (value.HedgeMaxConcurrent < 2 || value.HedgeMaxConcurrent > 6) {
+		return errors.New("qualityGuard.requestRetry.hedgeMaxConcurrent 必须在 2 到 6 之间")
 	}
 	return nil
 }
@@ -968,6 +980,7 @@ func defaultConfig() Config {
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
 				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4,
+				HedgeEnabled: false, HedgeDelay: Duration(8 * time.Second), HedgeMaxConcurrent: 2,
 			},
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},

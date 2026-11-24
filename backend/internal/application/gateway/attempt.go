@@ -336,6 +336,12 @@ func (r *failureAttemptRecorder) append(attempt audit.Attempt) {
 	r.attempts = append(r.attempts, attempt)
 }
 
+func (r *failureAttemptRecorder) appendAll(attempts []audit.Attempt) {
+	for _, attempt := range attempts {
+		r.append(attempt)
+	}
+}
+
 // captureBody 在单次和单请求预算内保留可读的脱敏正文片段。
 func (r *failureAttemptRecorder) captureBody(body []byte, alreadyTruncated bool) ([]byte, bool) {
 	if len(body) == 0 {
