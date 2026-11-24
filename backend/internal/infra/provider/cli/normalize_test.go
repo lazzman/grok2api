@@ -115,20 +115,26 @@ func TestNormalizeBuildReasoningMetadataRejectsArbitraryValuesAndDefaults(t *tes
 func TestNormalizeBuildChatRequestsVisibleReasoningSummary(t *testing.T) {
 	tests := []struct {
 		name        string
+		model       string
 		operation   string
 		body        string
 		wantSummary string
 		wantEffort  string
 		wantObject  bool
 	}{
-		{name: "Chat model default", operation: conversation.OperationChat, body: `{"input":"hello"}`, wantSummary: "concise", wantObject: true},
-		{name: "Chat explicit effort", operation: conversation.OperationChat, body: `{"input":"hello","reasoning":{"effort":"high"}}`, wantSummary: "concise", wantEffort: "high", wantObject: true},
-		{name: "Chat explicit summary", operation: conversation.OperationChat, body: `{"input":"hello","reasoning":{"effort":"high","summary":"detailed"}}`, wantSummary: "detailed", wantEffort: "high", wantObject: true},
-		{name: "native Responses remains caller controlled", operation: conversation.OperationResponses, body: `{"input":"hello"}`},
+		{name: "Chat model default", model: "grok-4.6", operation: conversation.OperationChat, body: `{"input":"hello"}`, wantSummary: "concise", wantObject: true},
+		{name: "Chat explicit effort", model: "grok-4.6", operation: conversation.OperationChat, body: `{"input":"hello","reasoning":{"effort":"high"}}`, wantSummary: "concise", wantEffort: "high", wantObject: true},
+		{name: "Chat explicit summary", model: "grok-4.6", operation: conversation.OperationChat, body: `{"input":"hello","reasoning":{"effort":"high","summary":"detailed"}}`, wantSummary: "detailed", wantEffort: "high", wantObject: true},
+		{name: "Chat disabled reasoning skips summary", model: "grok-4.3", operation: conversation.OperationChat, body: `{"input":"hello","reasoning":{"effort":"none"}}`, wantEffort: "none", wantObject: true},
+		{name: "Responses model default injects concise summary", model: "grok-4.6", operation: conversation.OperationResponses, body: `{"input":"hello"}`, wantSummary: "concise", wantObject: true},
+		{name: "Responses explicit effort injects concise summary", model: "grok-4.6", operation: conversation.OperationResponses, body: `{"input":"hello","reasoning":{"effort":"high"}}`, wantSummary: "concise", wantEffort: "high", wantObject: true},
+		{name: "Responses explicit summary preserved", model: "grok-4.6", operation: conversation.OperationResponses, body: `{"input":"hello","reasoning":{"effort":"high","summary":"detailed"}}`, wantSummary: "detailed", wantEffort: "high", wantObject: true},
+		{name: "Responses disabled reasoning skips summary", model: "grok-4.3", operation: conversation.OperationResponses, body: `{"input":"hello","reasoning":{"effort":"none"}}`, wantEffort: "none", wantObject: true},
+		{name: "Responses non-reasoning model skips summary", model: "grok-4.20-0309-non-reasoning", operation: conversation.OperationResponses, body: `{"input":"hello"}`, wantObject: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			normalized, err := normalizeBuildRequest([]byte(test.body), "grok-4.6", test.operation)
+			normalized, err := normalizeBuildRequest([]byte(test.body), test.model, test.operation)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -143,7 +149,8 @@ func TestNormalizeBuildChatRequestsVisibleReasoningSummary(t *testing.T) {
 			if !ok {
 				return
 			}
-			if reasoning["summary"] != test.wantSummary {
+			summary, _ := reasoning["summary"].(string)
+			if summary != test.wantSummary {
 				t.Fatalf("summary = %#v, want %q", reasoning["summary"], test.wantSummary)
 			}
 			if effort, _ := reasoning["effort"].(string); effort != test.wantEffort {

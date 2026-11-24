@@ -26,18 +26,9 @@ const (
 	defaultQualityMinOutput                = int64(8)
 	defaultMinEncryptedBytes               = 256
 	defaultEncryptedBytesPerReasoningToken = 4
-	defaultBurstFlushMS                    = int64(1000)
-	defaultBurstMaxVisible                 = int64(32)
 	defaultBurstMinReasoning               = int64(80)
-	// Fake encrypted thinking dumps the whole visible answer after a long
-	// wait. Audit TPS is rewritten against full duration (looks like 60–120
-	// tok/s) but first-token ≈ duration. Catch flush windows up to 2s so
-	// 1.8s / 1962-token dumps are withheld too.
+	// 短窗爆吐检测阈值：用于拦截 2s 内高推理占比爆吐及极短正文虚报大推理账单的降智响应。
 	defaultFakeEncFlushMS = int64(2000)
-	// Cipher-only "thinking" that is already dumping this much visible text
-	// with usage.reasoning_tokens=0 is the 128k status-loop drool, not a
-	// real encrypted thinking stream.
-	defaultCipherDroolVisible        = int64(1024)
 	defaultMissingThinkingCooldown   = 12 * time.Hour
 	lastErrorMissingThinking         = accountdomain.LastErrorMissingThinking
 	lastErrorMissingThinkingDisabled = accountdomain.LastErrorMissingThinkingDisabled
@@ -100,11 +91,8 @@ type QualityWithholdReason string
 const (
 	QualityWithholdNone                  QualityWithholdReason = ""
 	QualityWithholdHoldExpiredShort      QualityWithholdReason = "hold_expired_short_visible"
-	QualityWithholdCipherBurst           QualityWithholdReason = "cipher_burst_dump"
 	QualityWithholdFakeEncryptedBurst    QualityWithholdReason = "fake_encrypted_burst"
 	QualityWithholdPlaintextRatioBurst   QualityWithholdReason = "plaintext_ratio_burst"
-	QualityWithholdCipherDroolVisible    QualityWithholdReason = "cipher_drool_visible"
-	QualityWithholdCipherDroolTerminal   QualityWithholdReason = "cipher_drool_terminal"
 	QualityWithholdMissingThinkingStream QualityWithholdReason = "missing_thinking_stream"
 	QualityWithholdMissingThinkingTerm   QualityWithholdReason = "missing_thinking_terminal"
 	QualityWithholdMissingThinkingExpire QualityWithholdReason = "missing_thinking_hold_expired"
@@ -213,71 +201,6 @@ func qualityFastFlush(sig QualityStreamSignals, limitMS int64) bool {
 	return sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < limitMS
 }
 
-func qualityMeetsEncryptedFloor(sig QualityStreamSignals) bool {
-	if sig.EncryptedBytes <= 0 {
-		return false
-	}
-	floor := sig.EncryptedFloor
-	if floor <= 0 {
-		floor = encryptedThinkingFloor(0, 0, sig.ReasoningTokens)
-	}
-	return int64(sig.EncryptedBytes) >= floor
-}
-
-func qualityHasDumpBill(sig QualityStreamSignals) bool {
-	return sig.ReasoningTokens >= defaultBurstMinReasoning || qualityMeetsEncryptedFloor(sig)
-}
-
-func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
-	return classifyQualityBurstDump(sig, minOutput) != QualityWithholdNone
-}
-
-func classifyQualityBurstDump(sig QualityStreamSignals, minOutput int64) QualityWithholdReason {
-	_ = minOutput
-	if sig.HasReasoningDelta {
-		return QualityWithholdNone
-	}
-	visible := sig.VisibleTokens
-	heavyReasoning := sig.ReasoningTokens >= defaultBurstMinReasoning
-	shortVisible := visible > 0 && visible < defaultBurstMaxVisible
-	// Hold timed out, then a short greeting dumped with a large reasoning bill
-	// (TUI "你好" after 30s / 954 thinking tokens).
-	if sig.HoldExpired && shortVisible && heavyReasoning {
-		return QualityWithholdHoldExpiredShort
-	}
-	if qualityFastFlush(sig, defaultBurstFlushMS) && qualityHasDumpBill(sig) {
-		return QualityWithholdCipherBurst
-	}
-	return QualityWithholdNone
-}
-
-// qualityIsFakeEncryptedDump is the 18190 / 18183 dump: ciphertext or a
-// large reasoning bill, then the visible answer arrives in <2s. Visible
-// token count is not a gate — vis<8 chat dumps were leaking on minOutput.
-func qualityIsFakeEncryptedDump(sig QualityStreamSignals, minOutput int64) bool {
-	return classifyQualityFakeEncryptedDump(sig, minOutput) != QualityWithholdNone
-}
-
-func classifyQualityFakeEncryptedDump(sig QualityStreamSignals, minOutput int64) QualityWithholdReason {
-	_ = minOutput
-	if sig.HasReasoningDelta {
-		return QualityWithholdNone
-	}
-	if !qualityFastFlush(sig, defaultFakeEncFlushMS) {
-		return QualityWithholdNone
-	}
-	if qualityHasDumpBill(sig) {
-		return QualityWithholdFakeEncryptedBurst
-	}
-	return QualityWithholdNone
-}
-
-// qualityIsFastReasoningRatioDump catches plaintext thinking that is still a
-// 1ms dump: billed reasoning is ≥80% of output and the visible flush is <2s.
-func qualityIsFastReasoningRatioDump(sig QualityStreamSignals) bool {
-	return classifyQualityFastReasoningRatioDump(sig) != QualityWithholdNone
-}
-
 func classifyQualityFastReasoningRatioDump(sig QualityStreamSignals) QualityWithholdReason {
 	if !sig.HasReasoningDelta {
 		return QualityWithholdNone
@@ -298,109 +221,62 @@ func classifyQualityFastReasoningRatioDump(sig QualityStreamSignals) QualityWith
 	return QualityWithholdNone
 }
 
-// qualityIsCipherDrool is the 128k TUI status-loop: ciphertext met the
-// floor so HasThinking is true, but there is no plaintext reasoning and
-// usage.reasoning_tokens is still 0 while visible text is already dumping.
-func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
-	return classifyQualityCipherDrool(sig, minOutput) != QualityWithholdNone
-}
-
-func classifyQualityCipherDrool(sig QualityStreamSignals, minOutput int64) QualityWithholdReason {
-	if minOutput <= 0 {
-		minOutput = defaultQualityMinOutput
-	}
-	if sig.HasReasoningDelta || sig.ReasoningTokens > 0 {
-		return QualityWithholdNone
-	}
-	if sig.EncryptedBytes <= 0 {
-		return QualityWithholdNone
-	}
-	visible := sig.VisibleTokens
-	if visible >= defaultCipherDroolVisible {
-		return QualityWithholdCipherDroolVisible
-	}
-	if sig.Terminal && visible >= minOutput {
-		return QualityWithholdCipherDroolTerminal
-	}
-	return QualityWithholdNone
-}
-
-// ClassifyQualityHold decides whether a held stream may be forwarded.
-// Dump detectors run first so plaintext thinking cannot veto a 1ms
-// reasoning-ratio dump, and vis<minOutput cannot skip fake-enc/burst.
-// Remaining plaintext deltas still deliver. Cipher-only HasThinking waits
-// until visible text has streamed for 2s or the stream ends.
+// ClassifyQualityHold 判定当前扣留的流式响应应继续等待、放行还是按降智扣留。
 func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdict {
 	verdict, _ := ClassifyQualityHoldWithReason(sig, minOutput)
 	return verdict
 }
 
-// ClassifyQualityHoldWithReason 在保持与 ClassifyQualityHold 完全一致裁决的同时返回具体命中原因。
+// ClassifyQualityHoldWithReason 执行「无思考明文即降智、纯工具与极短回复放行」规则并返回具体原因：
+//  1. 收到思考明文（HasReasoningDelta）：仅保留 2s 内高推理占比爆吐拦截，其余立即放行；
+//  2. 无思考明文时，纯客户端工具调用（或未超时前仅带极短前缀的工具调用）放行；
+//  3. 无思考明文且极短正文却虚报大推理账单（reasoning_tokens >= 80）直接扣留；
+//  4. 无思考明文且可见正文达到 minOutput（不再认可纯密文 encrypted_content）直接扣留；
+//  5. 复用 holdTimeout：超时仍无思考明文（含 0 输出静默、空占位或纯密文）直接扣留；
+//  6. 未超时且已结束的极短回复（0 < output < minOutput）放行，空流交由传输错误处理。
 func ClassifyQualityHoldWithReason(sig QualityStreamSignals, minOutput int64) (QualityVerdict, QualityWithholdReason) {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	if reason := classifyQualityBurstDump(sig, minOutput); reason != QualityWithholdNone {
-		return QualityWithhold, reason
-	}
-	if reason := classifyQualityCipherDrool(sig, minOutput); reason != QualityWithholdNone {
-		return QualityWithhold, reason
-	}
-	if reason := classifyQualityFakeEncryptedDump(sig, minOutput); reason != QualityWithholdNone {
-		return QualityWithhold, reason
-	}
-	if reason := classifyQualityFastReasoningRatioDump(sig); reason != QualityWithholdNone {
-		return QualityWithhold, reason
-	}
-	if sig.HasThinking {
-		if sig.HasReasoningDelta {
-			return QualityDeliver, QualityWithholdNone
-		}
-		// Cipher-only: do not release when encrypted_content first meets
-		// the floor. Fake dumps send the blob, then the whole answer in
-		// <2s; releasing early lets that dump bypass fake-enc. Wait until
-		// visible text has streamed for 2s, or the stream ends.
-		if sig.Terminal {
-			return QualityDeliver, QualityWithholdNone
-		}
-		if sig.VisibleTokens >= minOutput && sig.FirstVisible && sig.VisibleFlushMS >= defaultFakeEncFlushMS {
-			return QualityDeliver, QualityWithholdNone
-		}
-		return QualityWait, QualityWithholdNone
-	}
-	// Prefer observed/derived visible output. Total output includes reasoning
-	// tokens, which are deliberately not trusted as quality evidence above. If
-	// the stream exposed no visible count at all, retain OutputTokens as a
-	// compatibility fallback for terminal usage-only responses.
-	output := sig.VisibleTokens
-	if output <= 0 {
-		output = sig.OutputTokens
-	}
-	enough := output >= minOutput
-	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
-		return QualityWait, QualityWithholdNone
-	}
-	if sig.Terminal {
-		if output <= 0 {
-			return QualityWait, QualityWithholdNone
-		}
-		if enough {
-			return QualityWithhold, QualityWithholdMissingThinkingTerm
+	if sig.HasReasoningDelta {
+		if reason := classifyQualityFastReasoningRatioDump(sig); reason != QualityWithholdNone {
+			return QualityWithhold, reason
 		}
 		return QualityDeliver, QualityWithholdNone
 	}
+	if sig.HasToolCall && (sig.VisibleTokens == 0 || (sig.VisibleTokens < minOutput && !sig.HoldExpired)) {
+		return QualityDeliver, QualityWithholdNone
+	}
+	output := sig.VisibleTokens
+	if output <= 0 && sig.Terminal && !sig.HasToolCall {
+		output = sig.OutputTokens
+	}
+	enough := output >= minOutput
+	heavyReasoning := sig.ReasoningTokens >= defaultBurstMinReasoning
+	shortVisible := sig.VisibleTokens > 0 && sig.VisibleTokens < minOutput
+	if shortVisible && heavyReasoning {
+		if sig.HoldExpired {
+			return QualityWithhold, QualityWithholdHoldExpiredShort
+		}
+		if sig.Terminal || qualityFastFlush(sig, defaultFakeEncFlushMS) {
+			return QualityWithhold, QualityWithholdFakeEncryptedBurst
+		}
+	}
 	if enough {
+		if sig.Terminal {
+			return QualityWithhold, QualityWithholdMissingThinkingTerm
+		}
 		if sig.HoldExpired {
 			return QualityWithhold, QualityWithholdMissingThinkingExpire
 		}
 		return QualityWithhold, QualityWithholdMissingThinkingStream
 	}
 	if sig.HoldExpired {
+		return QualityWithhold, QualityWithholdMissingThinkingExpire
+	}
+	if sig.Terminal {
 		if output <= 0 {
 			return QualityWait, QualityWithholdNone
-		}
-		if enough {
-			return QualityWithhold, QualityWithholdMissingThinkingExpire
 		}
 		return QualityDeliver, QualityWithholdNone
 	}

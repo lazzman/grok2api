@@ -32,6 +32,7 @@ type qualityScanState struct {
 	aggregateRunes                  int
 	semanticOutput                  bool
 	hasToolCall                     bool
+	lastAnthropicBlockServerTool    bool
 	reasoningTokens                 int64
 	outputTokens                    int64
 	encryptedBytes                  int
@@ -146,14 +147,11 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 	if s.usage.Reported && s.usage.OutputTokens > output {
 		output = s.usage.OutputTokens
 	}
-	// Usage.reasoning_tokens is not proof of thinking. 降智 accounts report
-	// hundreds of reasoning tokens on completed while the stream never sent
-	// reasoning_text / reasoning_summary deltas (TUI shows no thoughts).
-	// A non-empty encrypted_content stub is also not thinking until it meets
-	// the ciphertext floor (default 256 bytes, or 4 bytes per reasoning token).
+	// 仅收到思考明文增量（reasoning_text / reasoning_summary / thinking_delta）才计为有效思考；
+	// usage.reasoning_tokens 与 encrypted_content 仅保留为诊断字段，不再单独作为思考凭证。
 	reasoningTokens := max(s.reasoningTokens, s.usage.ReasoningTokens)
 	floor := encryptedThinkingFloor(s.minEncryptedBytes, s.encryptedBytesPerReasoningToken, reasoningTokens)
-	hasThinking := s.hasThinking || int64(s.encryptedBytes) >= floor
+	hasThinking := s.hasThinking
 	firstVisible := !s.firstVisibleAt.IsZero()
 	var flushMS int64
 	if firstVisible {
@@ -412,12 +410,32 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 			}
 		}
 	default:
-		// Function, shell, MCP and other call items are meaningful output even
-		// when the provider omits usage and argument-delta events.
+		// 区分客户端工具调用与服务端内置中间调用（如 web_search_call / code_interpreter_call）：
+		// 服务端内置调用之后仍会产出正式正文，不能按纯工具调用提前放行。
 		state.semanticOutput = true
-		state.hasToolCall = true
+		if !isResponsesServerSideToolItem(item.Type) {
+			state.hasToolCall = true
+		}
 	}
 	return visibleRunes
+}
+
+func isResponsesServerSideToolItem(itemType string) bool {
+	switch strings.ToLower(strings.TrimSpace(itemType)) {
+	case "web_search_call", "x_search_call", "file_search_call", "code_interpreter_call", "image_generation_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAnthropicServerSideToolBlock(blockType string) bool {
+	switch strings.ToLower(strings.TrimSpace(blockType)) {
+	case "server_tool_use", "web_search_tool_result", "code_execution_tool_result":
+		return true
+	default:
+		return false
+	}
 }
 
 func observeQualityAnthropic(state *qualityScanState, payload []byte) {
@@ -449,6 +467,7 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 	case "message_stop":
 		state.terminal = true
 	case "content_block_start":
+		state.lastAnthropicBlockServerTool = isAnthropicServerSideToolBlock(event.ContentBlock.Type)
 		switch event.ContentBlock.Type {
 		case "thinking":
 			state.reasoningStarted = true
@@ -463,15 +482,15 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 		case "":
 		default:
 			state.semanticOutput = true
-			state.hasToolCall = true
+			if !state.lastAnthropicBlockServerTool {
+				state.hasToolCall = true
+			}
 		}
 	case "content_block_delta":
 		if event.Delta.Type == "thinking_delta" && strings.TrimSpace(event.Delta.Thinking) != "" {
 			state.hasThinking = true
 		}
 		if event.Delta.Type == "signature_delta" && strings.TrimSpace(event.Delta.Signature) != "" {
-			// Anthropic Messages represents Responses encrypted_content as a
-			// signature delta. Length is judged against the ciphertext floor.
 			state.reasoningStarted = true
 			noteEncryptedBytes(state, event.Delta.Signature)
 		}
@@ -480,7 +499,9 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 		}
 		if event.Delta.Type == "input_json_delta" && event.Delta.PartialJSON != "" {
 			state.semanticOutput = true
-			state.hasToolCall = true
+			if !state.lastAnthropicBlockServerTool {
+				state.hasToolCall = true
+			}
 		}
 	}
 	if event.Usage != nil {
@@ -543,7 +564,7 @@ func peekQualityStreamWithDiagnostic(ctx context.Context, body io.ReadCloser, pr
 			}, qualityPeekAbortError(ctx, ctx.Err())
 		case <-holdTimer.C:
 			state.holdExpired = true
-			sig.HoldExpired = true
+			sig = state.signals()
 			if verdict, reason := ClassifyQualityHoldWithReason(sig, cfg.MinOutputTokens); verdict != QualityWait {
 				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, QualityPeekDiagnostic{
 					Protocol: protocol, Reason: reason, MinOutputTokens: cfg.MinOutputTokens, Signals: sig,

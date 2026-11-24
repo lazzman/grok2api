@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -101,12 +102,17 @@ func normalizeBuildRequestPayloadWithMetadata(payload map[string]json.RawMessage
 	if normalizeBuildReasoningEffortPayload(payload, model) {
 		changed = true
 	}
-	// grok-build 1.0.4 always requests a concise reasoning summary from its
-	// Responses backend, even when it uses the model's default effort. Chat
-	// Completions has no separate summary parameter, so make that Build-specific
-	// compatibility contract explicit without changing native Responses,
-	// Console, or Web semantics.
-	if operation == conversation.OperationChat {
+	// Build 通道下对齐 grok-build 摘要契约：Chat Completions 与支持推理的原生 Responses
+	// 在未显式传入 reasoning.summary 且未禁用推理时，默认补齐 concise 思考摘要，
+	// 保证健康推理流能稳定输出思考明文；若调用方已指定 summary 或显式禁用推理则保持原样。
+	shouldDefaultSummary := false
+	switch operation {
+	case conversation.OperationChat:
+		shouldDefaultSummary = !buildReasoningDisabled(payload)
+	case conversation.OperationResponses, "":
+		shouldDefaultSummary = modeldomain.SupportsReasoningForProvider(accountdomain.ProviderBuild, model) && !buildReasoningDisabled(payload)
+	}
+	if shouldDefaultSummary {
 		var reasoning map[string]json.RawMessage
 		if raw := payload["reasoning"]; !isEmptyJSON(raw) {
 			if err := json.Unmarshal(raw, &reasoning); err != nil {
@@ -175,6 +181,19 @@ func buildReasoningEffort(payload map[string]json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return reasoning.Effort, true
+}
+
+func buildReasoningDisabled(payload map[string]json.RawMessage) bool {
+	if effort, ok := buildReasoningEffort(payload); ok && strings.EqualFold(strings.TrimSpace(effort), modeldomain.ReasoningEffortNone) {
+		return true
+	}
+	var effort string
+	if raw := payload["reasoning_effort"]; !isEmptyJSON(raw) && json.Unmarshal(raw, &effort) == nil {
+		if strings.EqualFold(strings.TrimSpace(effort), modeldomain.ReasoningEffortNone) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyBuildResponseDefaults mirrors the official Grok Build client boundary.
