@@ -75,22 +75,47 @@ type QualityRetryRuntime struct {
 // QualityStreamSignals is the hold classifier input. Tests drive this
 // directly and via ObserveQualityChunk on SSE fixtures.
 type QualityStreamSignals struct {
-	HasThinking       bool
-	HasReasoningDelta bool
+	HasThinking       bool `json:"has_thinking"`
+	HasReasoningDelta bool `json:"has_reasoning_delta"`
 	// ReasoningStarted is an empty reasoning item or the Chat SSE stub
 	// `: grok2api-reasoning-start`. That is not proof of thinking: 降智
 	// still emits the stub, then dumps visible tokens with usage 0.
-	ReasoningStarted bool
-	VisibleTokens    int64
-	ReasoningTokens  int64
-	OutputTokens     int64
-	EncryptedBytes   int
-	EncryptedFloor   int64
-	UsageReported    bool
-	FirstVisible     bool
-	VisibleFlushMS   int64
-	Terminal         bool
-	HoldExpired      bool
+	ReasoningStarted bool  `json:"reasoning_started"`
+	HasToolCall      bool  `json:"has_tool_call"`
+	VisibleTokens    int64 `json:"visible_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	EncryptedBytes   int   `json:"encrypted_bytes"`
+	EncryptedFloor   int64 `json:"encrypted_floor"`
+	UsageReported    bool  `json:"usage_reported"`
+	FirstVisible     bool  `json:"first_visible"`
+	VisibleFlushMS   int64 `json:"visible_flush_ms"`
+	Terminal         bool  `json:"terminal"`
+	HoldExpired      bool  `json:"hold_expired"`
+}
+
+// QualityWithholdReason 标识流式质量闸门扣留响应的具体规则分支，用于日志与诊断定位。
+type QualityWithholdReason string
+
+const (
+	QualityWithholdNone                  QualityWithholdReason = ""
+	QualityWithholdHoldExpiredShort      QualityWithholdReason = "hold_expired_short_visible"
+	QualityWithholdCipherBurst           QualityWithholdReason = "cipher_burst_dump"
+	QualityWithholdFakeEncryptedBurst    QualityWithholdReason = "fake_encrypted_burst"
+	QualityWithholdPlaintextRatioBurst   QualityWithholdReason = "plaintext_ratio_burst"
+	QualityWithholdCipherDroolVisible    QualityWithholdReason = "cipher_drool_visible"
+	QualityWithholdCipherDroolTerminal   QualityWithholdReason = "cipher_drool_terminal"
+	QualityWithholdMissingThinkingStream QualityWithholdReason = "missing_thinking_stream"
+	QualityWithholdMissingThinkingTerm   QualityWithholdReason = "missing_thinking_terminal"
+	QualityWithholdMissingThinkingExpire QualityWithholdReason = "missing_thinking_hold_expired"
+)
+
+// QualityPeekDiagnostic 保存质量闸门做出裁决时的协议、命中的规则原因与关键信号快照。
+type QualityPeekDiagnostic struct {
+	Protocol        string                `json:"protocol"`
+	Reason          QualityWithholdReason `json:"reason,omitempty"`
+	MinOutputTokens int64                 `json:"min_output_tokens"`
+	Signals         QualityStreamSignals  `json:"signals"`
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -204,9 +229,13 @@ func qualityHasDumpBill(sig QualityStreamSignals) bool {
 }
 
 func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
+	return classifyQualityBurstDump(sig, minOutput) != QualityWithholdNone
+}
+
+func classifyQualityBurstDump(sig QualityStreamSignals, minOutput int64) QualityWithholdReason {
 	_ = minOutput
 	if sig.HasReasoningDelta {
-		return false
+		return QualityWithholdNone
 	}
 	visible := sig.VisibleTokens
 	heavyReasoning := sig.ReasoningTokens >= defaultBurstMinReasoning
@@ -214,68 +243,86 @@ func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
 	// Hold timed out, then a short greeting dumped with a large reasoning bill
 	// (TUI "你好" after 30s / 954 thinking tokens).
 	if sig.HoldExpired && shortVisible && heavyReasoning {
-		return true
+		return QualityWithholdHoldExpiredShort
 	}
 	if qualityFastFlush(sig, defaultBurstFlushMS) && qualityHasDumpBill(sig) {
-		return true
+		return QualityWithholdCipherBurst
 	}
-	return false
+	return QualityWithholdNone
 }
 
 // qualityIsFakeEncryptedDump is the 18190 / 18183 dump: ciphertext or a
 // large reasoning bill, then the visible answer arrives in <2s. Visible
 // token count is not a gate — vis<8 chat dumps were leaking on minOutput.
 func qualityIsFakeEncryptedDump(sig QualityStreamSignals, minOutput int64) bool {
+	return classifyQualityFakeEncryptedDump(sig, minOutput) != QualityWithholdNone
+}
+
+func classifyQualityFakeEncryptedDump(sig QualityStreamSignals, minOutput int64) QualityWithholdReason {
 	_ = minOutput
 	if sig.HasReasoningDelta {
-		return false
+		return QualityWithholdNone
 	}
 	if !qualityFastFlush(sig, defaultFakeEncFlushMS) {
-		return false
+		return QualityWithholdNone
 	}
-	return qualityHasDumpBill(sig)
+	if qualityHasDumpBill(sig) {
+		return QualityWithholdFakeEncryptedBurst
+	}
+	return QualityWithholdNone
 }
 
 // qualityIsFastReasoningRatioDump catches plaintext thinking that is still a
 // 1ms dump: billed reasoning is ≥80% of output and the visible flush is <2s.
 func qualityIsFastReasoningRatioDump(sig QualityStreamSignals) bool {
+	return classifyQualityFastReasoningRatioDump(sig) != QualityWithholdNone
+}
+
+func classifyQualityFastReasoningRatioDump(sig QualityStreamSignals) QualityWithholdReason {
 	if !sig.HasReasoningDelta {
-		return false
+		return QualityWithholdNone
 	}
 	if !qualityFastFlush(sig, defaultFakeEncFlushMS) {
-		return false
+		return QualityWithholdNone
 	}
 	output := sig.OutputTokens
 	if output <= 0 {
 		output = sig.VisibleTokens + sig.ReasoningTokens
 	}
 	if output <= 0 || sig.ReasoningTokens <= 0 {
-		return false
+		return QualityWithholdNone
 	}
-	return sig.ReasoningTokens*5 >= output*4
+	if sig.ReasoningTokens*5 >= output*4 {
+		return QualityWithholdPlaintextRatioBurst
+	}
+	return QualityWithholdNone
 }
 
 // qualityIsCipherDrool is the 128k TUI status-loop: ciphertext met the
 // floor so HasThinking is true, but there is no plaintext reasoning and
 // usage.reasoning_tokens is still 0 while visible text is already dumping.
 func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
+	return classifyQualityCipherDrool(sig, minOutput) != QualityWithholdNone
+}
+
+func classifyQualityCipherDrool(sig QualityStreamSignals, minOutput int64) QualityWithholdReason {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
 	if sig.HasReasoningDelta || sig.ReasoningTokens > 0 {
-		return false
+		return QualityWithholdNone
 	}
 	if sig.EncryptedBytes <= 0 {
-		return false
+		return QualityWithholdNone
 	}
 	visible := sig.VisibleTokens
 	if visible >= defaultCipherDroolVisible {
-		return true
+		return QualityWithholdCipherDroolVisible
 	}
 	if sig.Terminal && visible >= minOutput {
-		return true
+		return QualityWithholdCipherDroolTerminal
 	}
-	return false
+	return QualityWithholdNone
 }
 
 // ClassifyQualityHold decides whether a held stream may be forwarded.
@@ -284,27 +331,42 @@ func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
 // Remaining plaintext deltas still deliver. Cipher-only HasThinking waits
 // until visible text has streamed for 2s or the stream ends.
 func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdict {
+	verdict, _ := ClassifyQualityHoldWithReason(sig, minOutput)
+	return verdict
+}
+
+// ClassifyQualityHoldWithReason 在保持与 ClassifyQualityHold 完全一致裁决的同时返回具体命中原因。
+func ClassifyQualityHoldWithReason(sig QualityStreamSignals, minOutput int64) (QualityVerdict, QualityWithholdReason) {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) {
-		return QualityWithhold
+	if reason := classifyQualityBurstDump(sig, minOutput); reason != QualityWithholdNone {
+		return QualityWithhold, reason
+	}
+	if reason := classifyQualityCipherDrool(sig, minOutput); reason != QualityWithholdNone {
+		return QualityWithhold, reason
+	}
+	if reason := classifyQualityFakeEncryptedDump(sig, minOutput); reason != QualityWithholdNone {
+		return QualityWithhold, reason
+	}
+	if reason := classifyQualityFastReasoningRatioDump(sig); reason != QualityWithholdNone {
+		return QualityWithhold, reason
 	}
 	if sig.HasThinking {
 		if sig.HasReasoningDelta {
-			return QualityDeliver
+			return QualityDeliver, QualityWithholdNone
 		}
 		// Cipher-only: do not release when encrypted_content first meets
 		// the floor. Fake dumps send the blob, then the whole answer in
 		// <2s; releasing early lets that dump bypass fake-enc. Wait until
 		// visible text has streamed for 2s, or the stream ends.
 		if sig.Terminal {
-			return QualityDeliver
+			return QualityDeliver, QualityWithholdNone
 		}
 		if sig.VisibleTokens >= minOutput && sig.FirstVisible && sig.VisibleFlushMS >= defaultFakeEncFlushMS {
-			return QualityDeliver
+			return QualityDeliver, QualityWithholdNone
 		}
-		return QualityWait
+		return QualityWait, QualityWithholdNone
 	}
 	// Prefer observed/derived visible output. Total output includes reasoning
 	// tokens, which are deliberately not trusted as quality evidence above. If
@@ -316,30 +378,72 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	}
 	enough := output >= minOutput
 	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
-		return QualityWait
+		return QualityWait, QualityWithholdNone
 	}
 	if sig.Terminal {
 		if output <= 0 {
-			return QualityWait
+			return QualityWait, QualityWithholdNone
 		}
 		if enough {
-			return QualityWithhold
+			return QualityWithhold, QualityWithholdMissingThinkingTerm
 		}
-		return QualityDeliver
+		return QualityDeliver, QualityWithholdNone
 	}
 	if enough {
-		return QualityWithhold
+		if sig.HoldExpired {
+			return QualityWithhold, QualityWithholdMissingThinkingExpire
+		}
+		return QualityWithhold, QualityWithholdMissingThinkingStream
 	}
 	if sig.HoldExpired {
 		if output <= 0 {
-			return QualityWait
+			return QualityWait, QualityWithholdNone
 		}
 		if enough {
-			return QualityWithhold
+			return QualityWithhold, QualityWithholdMissingThinkingExpire
 		}
-		return QualityDeliver
+		return QualityDeliver, QualityWithholdNone
 	}
-	return QualityWait
+	return QualityWait, QualityWithholdNone
+}
+
+func qualityDiagnosticTransportError(reason QualityWithholdReason) string {
+	if reason == QualityWithholdNone {
+		return ErrorQualityDegraded
+	}
+	return ErrorQualityDegraded + ": " + string(reason)
+}
+
+func marshalQualityDiagnostic(diag QualityPeekDiagnostic) []byte {
+	if diag.Protocol == "" && diag.Reason == QualityWithholdNone && diag.MinOutputTokens == 0 && diag.Signals == (QualityStreamSignals{}) {
+		return nil
+	}
+	raw, err := json.Marshal(diag)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func qualityDiagnosticLogAttrs(diag QualityPeekDiagnostic) []any {
+	sig := diag.Signals
+	return []any{
+		"reason", string(diag.Reason),
+		"protocol", diag.Protocol,
+		"min_output_tokens", diag.MinOutputTokens,
+		"has_thinking", sig.HasThinking,
+		"has_reasoning_delta", sig.HasReasoningDelta,
+		"reasoning_started", sig.ReasoningStarted,
+		"has_tool_call", sig.HasToolCall,
+		"visible_tokens", sig.VisibleTokens,
+		"reasoning_tokens", sig.ReasoningTokens,
+		"output_tokens", sig.OutputTokens,
+		"encrypted_bytes", sig.EncryptedBytes,
+		"encrypted_floor", sig.EncryptedFloor,
+		"visible_flush_ms", sig.VisibleFlushMS,
+		"hold_expired", sig.HoldExpired,
+		"terminal", sig.Terminal,
+	}
 }
 
 // qualityPeekAbortError prefers the idle-timeout cause over a plain
@@ -615,7 +719,7 @@ func (s *Service) applyOutputSpeedPenalty(ctx context.Context, record audit.Reco
 	return nil
 }
 
-func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, credential accountdomain.Credential, usage Usage, startedAt time.Time, trace *infraegress.Trace, provider accountdomain.Provider) {
+func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, credential accountdomain.Credential, usage Usage, startedAt time.Time, trace *infraegress.Trace, provider accountdomain.Provider, attempt *audit.Attempt) {
 	record := base
 	record.EventID = newAuditEventID()
 	accountID := credential.ID
@@ -632,6 +736,11 @@ func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, 
 	}
 	record.DurationMS = time.Since(startedAt).Milliseconds()
 	record.CreatedAt = time.Now().UTC()
+	if attempt != nil {
+		single := *attempt
+		single.Number = 1
+		record.Attempts = []audit.Attempt{single}
+	}
 	applyAuditEgress(&record, trace, provider)
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
 	defer cancel()

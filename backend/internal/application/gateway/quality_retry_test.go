@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2000,5 +2002,310 @@ func TestNormalizeQualityRetryDefaults(t *testing.T) {
 	got := normalizeQualityRetry(QualityRetryRuntime{Enabled: true})
 	if !got.Enabled || got.MaxAttempts != 6 || got.MinOutputTokens != 8 || got.OnExhausted != qualityRetryFailClosed || got.HoldTimeout != 30*time.Second || got.AccountCooldown != 12*time.Hour || got.IdleAccountCooldown != 15*time.Minute || got.MinEncryptedBytes != defaultMinEncryptedBytes || got.EncryptedBytesPerReasoningToken != defaultEncryptedBytesPerReasoningToken {
 		t.Fatalf("defaults = %#v", got)
+	}
+}
+
+
+func setupQualityHoldLoopTest(t *testing.T, names []string, responses map[int][]scriptedBuildResponse, cfg QualityRetryRuntime) (*Service, *relational.AccountRepository, []accountdomain.Credential, clientkey.Key, *scriptedBuildAdapter) {
+	t.Helper()
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-penalty-loop.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credentials := make([]accountdomain.Credential, 0, len(names))
+	byID := make(map[uint64][]scriptedBuildResponse, len(names))
+	for index, name := range names {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+			Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name, EncryptedAccessToken: name,
+			EncryptedRefreshToken: "refresh-" + name, ExpiresAt: time.Now().Add(time.Hour),
+			Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: 200 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+		if queue, ok := responses[index]; ok {
+			byID[credential.ID] = queue
+		}
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.7"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.7"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "quality-loop-key", Prefix: "qloop", SecretHash: strings.Repeat("e", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &scriptedBuildAdapter{responses: byID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 6)
+	service.UpdateQualityRetry(cfg)
+	return service, accountRepo, credentials, key, adapter
+}
+
+func TestAttemptLoopPropagatesStripReasoningEncryptedContentAcrossAccounts(t *testing.T) {
+	ctx := context.Background()
+	noThink := sse(
+		`data: {"type":"response.created","response":{"id":"resp-bad","model":"grok-4.7"}}`,
+		`data: {"type":"response.output_text.delta","delta":"`+strings.Repeat("bad ", 20)+`"}`,
+		`data: {"type":"response.completed","response":{"id":"resp-bad","model":"grok-4.7","usage":{"output_tokens":40,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+	)
+	goodThink := sse(
+		`data: {"type":"response.created","response":{"id":"resp-good","model":"grok-4.7"}}`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"real reasoning"}`,
+		`data: {"type":"response.output_text.delta","delta":"good answer"}`,
+		`data: {"type":"response.completed","response":{"id":"resp-good","model":"grok-4.7","usage":{"output_tokens":40,"output_tokens_details":{"reasoning_tokens":20}}}}`,
+	)
+	service, _, _, key, adapter := setupQualityHoldLoopTest(
+		t,
+		[]string{"downgrade-first", "stripped-second"},
+		map[int][]scriptedBuildResponse{
+			0: {{status: http.StatusOK, body: noThink, reasoningEncryptedContentDowngraded: true}},
+			1: {{status: http.StatusOK, body: goodThink}},
+		},
+		QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+		},
+	)
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-strip-propagate", ClientKey: key, PublicModel: "grok-4.7", Streaming: true,
+		Body: []byte(`{"model":"grok-4.7","input":[{"type":"reasoning","summary":[],"encrypted_content":"old-model-cipher"},{"role":"user","content":"continue"}],"stream":true}`),
+	})
+	if err != nil {
+		t.Fatalf("expected delivery on 2nd account, err=%v", err)
+	}
+	_, _ = io.ReadAll(result.Body)
+	result.Finalize(Usage{Reported: true, OutputTokens: 40, ReasoningTokens: 20}, "resp-good", "")
+	_ = result.Body.Close()
+
+	flags := adapter.StripEncrypted()
+	if len(flags) != 2 || flags[0] || !flags[1] {
+		t.Fatalf("StripReasoningEncryptedContent propagation = %v, want [false true]", flags)
+	}
+}
+
+func TestClassifyQualityHoldWithReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		sig        QualityStreamSignals
+		minOutput  int64
+		want       QualityVerdict
+		wantReason QualityWithholdReason
+	}{
+		{
+			name: "hold-expired short greeting with heavy reasoning reports hold_expired_short_visible",
+			sig: QualityStreamSignals{
+				HasThinking: true, VisibleTokens: 2, ReasoningTokens: 954, OutputTokens: 960,
+				EncryptedBytes: 4000, EncryptedFloor: 3816, HoldExpired: true, Terminal: true,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdHoldExpiredShort,
+		},
+		{
+			name: "sub-second cipher burst dump reports cipher_burst_dump",
+			sig: QualityStreamSignals{
+				HasThinking: true, VisibleTokens: 12, ReasoningTokens: 3242, OutputTokens: 3300,
+				EncryptedBytes: 14000, EncryptedFloor: 12968, FirstVisible: true, VisibleFlushMS: 0, Terminal: true,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdCipherBurst,
+		},
+		{
+			name: "1.8s fake encrypted dump reports fake_encrypted_burst",
+			sig: QualityStreamSignals{
+				HasThinking: true, VisibleTokens: 1962, ReasoningTokens: 1813,
+				EncryptedBytes: 8000, EncryptedFloor: 7252, FirstVisible: true, VisibleFlushMS: 1776, Terminal: true,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdFakeEncryptedBurst,
+		},
+		{
+			name: "plaintext ratio dump reports plaintext_ratio_burst",
+			sig: QualityStreamSignals{
+				HasThinking: true, HasReasoningDelta: true, VisibleTokens: 9, OutputTokens: 1425, ReasoningTokens: 1416,
+				EncryptedBytes: 8000, FirstVisible: true, VisibleFlushMS: 4, Terminal: true,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdPlaintextRatioBurst,
+		},
+		{
+			name: "cipher drool midstream reports cipher_drool_visible",
+			sig: QualityStreamSignals{
+				HasThinking: true, VisibleTokens: 1024, EncryptedBytes: 4000,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdCipherDroolVisible,
+		},
+		{
+			name: "cipher drool terminal reports cipher_drool_terminal",
+			sig: QualityStreamSignals{
+				HasThinking: true, VisibleTokens: 12, EncryptedBytes: 4000, Terminal: true,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdCipherDroolTerminal,
+		},
+		{
+			name: "missing thinking midstream reports missing_thinking_stream",
+			sig: QualityStreamSignals{
+				VisibleTokens: 12,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdMissingThinkingStream,
+		},
+		{
+			name: "missing thinking terminal reports missing_thinking_terminal",
+			sig: QualityStreamSignals{
+				VisibleTokens: 12, Terminal: true,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdMissingThinkingTerm,
+		},
+		{
+			name: "missing thinking hold expired reports missing_thinking_hold_expired",
+			sig: QualityStreamSignals{
+				VisibleTokens: 12, HoldExpired: true,
+			},
+			minOutput: 8, want: QualityWithhold, wantReason: QualityWithholdMissingThinkingExpire,
+		},
+		{
+			name: "plaintext thinking delivers with empty reason",
+			sig: QualityStreamSignals{
+				HasThinking: true, HasReasoningDelta: true, VisibleTokens: 20,
+			},
+			minOutput: 8, want: QualityDeliver, wantReason: QualityWithholdNone,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, reason := ClassifyQualityHoldWithReason(tt.sig, tt.minOutput)
+			if got != tt.want || reason != tt.wantReason {
+				t.Fatalf("ClassifyQualityHoldWithReason(%+v) = (%s, %q), want (%s, %q)", tt.sig, got, reason, tt.want, tt.wantReason)
+			}
+			if legacy := ClassifyQualityHold(tt.sig, tt.minOutput); legacy != got {
+				t.Fatalf("ClassifyQualityHold = %s, diverged from ClassifyQualityHoldWithReason = %s", legacy, got)
+			}
+		})
+	}
+}
+
+func TestAttemptLoopQualityDegradedPersistsDiagnosticAndLogsReason(t *testing.T) {
+	ctx := context.Background()
+	badStub := sse(
+		`data: {"type":"response.created","response":{"id":"resp-stub","model":"grok-4.7"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"`+strings.Repeat("X", 400)+`"}}`,
+		`data: {"type":"response.output_text.delta","delta":"已处理完成。"}`,
+		`data: {"type":"response.completed","response":{"id":"resp-stub","model":"grok-4.7","usage":{"input_tokens":12892,"output_tokens":3300,"output_tokens_details":{"reasoning_tokens":3242}}}}`,
+	)
+	goodThink := sse(
+		`data: {"type":"response.created","response":{"id":"resp-good","model":"grok-4.7"}}`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"real reasoning"}`,
+		`data: {"type":"response.output_text.delta","delta":"good answer"}`,
+		`data: {"type":"response.completed","response":{"id":"resp-good","model":"grok-4.7","usage":{"input_tokens":12892,"output_tokens":40,"output_tokens_details":{"reasoning_tokens":20}}}}`,
+	)
+	service, accounts, credentials, key, _ := setupQualityHoldLoopTest(
+		t,
+		[]string{"diag-bad", "diag-good"},
+		map[int][]scriptedBuildResponse{
+			0: {{status: http.StatusOK, body: badStub}},
+			1: {{status: http.StatusOK, body: goodThink}},
+		},
+		QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second, AutoDisable: true,
+		},
+	)
+	var logBuf bytes.Buffer
+	service.logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-quality-diag", ClientKey: key, PublicModel: "grok-4.7", Streaming: true,
+		Body: []byte(`{"model":"grok-4.7","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatalf("expected delivery on 2nd account, err=%v", err)
+	}
+	_, _ = io.ReadAll(result.Body)
+	result.Finalize(Usage{Reported: true, InputTokens: 12892, OutputTokens: 40, ReasoningTokens: 20}, "resp-good", "")
+	_ = result.Body.Close()
+
+	logText := logBuf.String()
+	for _, wantSubstr := range []string{
+		`"msg":"quality_degraded_retry"`,
+		`"reason":"cipher_burst_dump"`,
+		`"encrypted_bytes":400`,
+		`"encrypted_floor":12968`,
+		`"reasoning_tokens":3242`,
+	} {
+		if !strings.Contains(logText, wantSubstr) {
+			t.Fatalf("expected log to contain %s, got:\n%s", wantSubstr, logText)
+		}
+	}
+
+	badAccount, err := accounts.Get(ctx, credentials[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if badAccount.Enabled || badAccount.LastError != lastErrorMissingThinkingDisabled {
+		t.Fatalf("withheld account must keep immediate penalty policy: %#v", badAccount)
+	}
+
+	auditRepo := service.audits.(*relational.AuditRepository)
+	logs, _, err := auditRepo.List(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var degradedID, deliveredID uint64
+	for _, row := range logs {
+		if row.ErrorCode == ErrorQualityDegraded && row.AccountID != nil && *row.AccountID == credentials[0].ID {
+			degradedID = row.ID
+		}
+		if row.ErrorCode == "" && row.AccountID != nil && *row.AccountID == credentials[1].ID {
+			deliveredID = row.ID
+		}
+	}
+	if degradedID == 0 || deliveredID == 0 {
+		t.Fatalf("expected both degraded and delivered audits, logs=%#v", logs)
+	}
+	for _, check := range []struct {
+		label string
+		id    uint64
+	}{
+		{label: "degraded", id: degradedID},
+		{label: "delivered", id: deliveredID},
+	} {
+		detail, err := auditRepo.Get(ctx, check.id)
+		if err != nil {
+			t.Fatalf("load %s audit: %v", check.label, err)
+		}
+		if detail.AttemptCount != 1 || len(detail.Attempts) != 1 {
+			t.Fatalf("%s audit expected 1 quality_hold attempt, got count=%d attempts=%#v", check.label, detail.AttemptCount, detail.Attempts)
+		}
+		attempt := detail.Attempts[0]
+		if attempt.Stage != "quality_hold" || attempt.TransportError != "quality_degraded: cipher_burst_dump" {
+			t.Fatalf("%s attempt mismatch: %#v", check.label, attempt)
+		}
+		var parsed QualityPeekDiagnostic
+		if err := json.Unmarshal(attempt.ResponseBody, &parsed); err != nil {
+			t.Fatalf("%s diagnostic JSON invalid: %v, body=%q", check.label, err, string(attempt.ResponseBody))
+		}
+		if parsed.Reason != QualityWithholdCipherBurst || parsed.Signals.EncryptedBytes != 400 || parsed.Signals.EncryptedFloor != 12968 || parsed.Signals.ReasoningTokens != 3242 {
+			t.Fatalf("%s diagnostic payload mismatch: %#v", check.label, parsed)
+		}
 	}
 }

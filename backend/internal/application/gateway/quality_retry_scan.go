@@ -31,6 +31,7 @@ type qualityScanState struct {
 	visibleRunes                    int
 	aggregateRunes                  int
 	semanticOutput                  bool
+	hasToolCall                     bool
 	reasoningTokens                 int64
 	outputTokens                    int64
 	encryptedBytes                  int
@@ -162,6 +163,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		HasThinking:       hasThinking,
 		HasReasoningDelta: s.hasThinking,
 		ReasoningStarted:  s.reasoningStarted || hasThinking,
+		HasToolCall:       s.hasToolCall,
 		VisibleTokens:     visible,
 		ReasoningTokens:   reasoningTokens,
 		OutputTokens:      output,
@@ -284,6 +286,7 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 		}
 		if len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
 			state.semanticOutput = true
+			state.hasToolCall = true
 		}
 		if choice.FinishReason != "" {
 			state.terminal = true
@@ -357,6 +360,7 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.mcp_call_arguments.delta":
 		if event.Delta != "" {
 			state.semanticOutput = true
+			state.hasToolCall = true
 		}
 	}
 	if event.Response != nil {
@@ -411,6 +415,7 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 		// Function, shell, MCP and other call items are meaningful output even
 		// when the provider omits usage and argument-delta events.
 		state.semanticOutput = true
+		state.hasToolCall = true
 	}
 	return visibleRunes
 }
@@ -458,6 +463,7 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 		case "":
 		default:
 			state.semanticOutput = true
+			state.hasToolCall = true
 		}
 	case "content_block_delta":
 		if event.Delta.Type == "thinking_delta" && strings.TrimSpace(event.Delta.Thinking) != "" {
@@ -474,6 +480,7 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 		}
 		if event.Delta.Type == "input_json_delta" && event.Delta.PartialJSON != "" {
 			state.semanticOutput = true
+			state.hasToolCall = true
 		}
 	}
 	if event.Usage != nil {
@@ -496,9 +503,14 @@ func noteVisibleContent(state *qualityScanState, text string) {
 }
 
 func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+	replay, verdict, usage, responseID, _, err := peekQualityStreamWithDiagnostic(ctx, body, protocol, cfg)
+	return replay, verdict, usage, responseID, err
+}
+
+func peekQualityStreamWithDiagnostic(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, QualityPeekDiagnostic, error) {
 	cfg = normalizeQualityRetry(cfg)
 	if body == nil {
-		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
+		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", QualityPeekDiagnostic{Protocol: protocol, MinOutputTokens: cfg.MinOutputTokens}, errQualityEmptyStream
 	}
 	pump := newQualityReadPump(body)
 	state := qualityScanState{
@@ -511,8 +523,10 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 	defer holdTimer.Stop()
 	for {
 		sig := state.signals()
-		if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
-			return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+		if verdict, reason := ClassifyQualityHoldWithReason(sig, cfg.MinOutputTokens); verdict != QualityWait {
+			return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, QualityPeekDiagnostic{
+				Protocol: protocol, Reason: reason, MinOutputTokens: cfg.MinOutputTokens, Signals: sig,
+			}, nil
 		}
 		// A completed empty stream must rotate immediately. Waiting for idle
 		// timeout after response.completed / [DONE] surfaces HTTP 200 with 0
@@ -524,12 +538,16 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 		select {
 		case <-ctx.Done():
 			_ = pump.Close()
-			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, ctx.Err())
+			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, QualityPeekDiagnostic{
+				Protocol: protocol, MinOutputTokens: cfg.MinOutputTokens, Signals: sig,
+			}, qualityPeekAbortError(ctx, ctx.Err())
 		case <-holdTimer.C:
 			state.holdExpired = true
 			sig.HoldExpired = true
-			if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
-				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+			if verdict, reason := ClassifyQualityHoldWithReason(sig, cfg.MinOutputTokens); verdict != QualityWait {
+				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, QualityPeekDiagnostic{
+					Protocol: protocol, Reason: reason, MinOutputTokens: cfg.MinOutputTokens, Signals: sig,
+				}, nil
 			}
 		case result, ok := <-pump.results:
 			if !ok {
@@ -538,7 +556,9 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 			if len(result.data) > 0 {
 				if held.Len()+len(result.data) > qualityHoldMaxBufferBytes {
 					_, _ = held.Write(result.data)
-					return newPrefixReplay(&held, pump), QualityDeliver, state.usage, state.responseID, nil
+					return newPrefixReplay(&held, pump), QualityDeliver, state.usage, state.responseID, QualityPeekDiagnostic{
+						Protocol: protocol, MinOutputTokens: cfg.MinOutputTokens, Signals: state.signals(),
+					}, nil
 				}
 				_, _ = held.Write(result.data)
 				ObserveQualityChunk(&state, result.data)
@@ -548,15 +568,17 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 			}
 			if result.err != nil {
 				_ = pump.Close()
-				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, result.err)
+				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, QualityPeekDiagnostic{
+					Protocol: protocol, MinOutputTokens: cfg.MinOutputTokens, Signals: state.signals(),
+				}, qualityPeekAbortError(ctx, result.err)
 			}
 		}
 	}
 }
 
-func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, QualityPeekDiagnostic, error) {
 	if state == nil {
-		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
+		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", QualityPeekDiagnostic{MinOutputTokens: cfg.MinOutputTokens}, errQualityEmptyStream
 	}
 	if len(state.pending) > 0 {
 		// Process a final valid SSE data line even when the upstream omitted its
@@ -565,13 +587,20 @@ func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *quality
 	}
 	state.terminal = true
 	signals := state.signals()
+	diag := QualityPeekDiagnostic{
+		Protocol:        state.protocol,
+		MinOutputTokens: cfg.MinOutputTokens,
+		Signals:         signals,
+	}
 	if !signals.HasThinking && signals.ReasoningTokens <= 0 && signals.OutputTokens <= 0 && signals.VisibleTokens <= 0 {
 		if state.semanticOutput {
-			return newPrefixReplay(held, pump), QualityDeliver, state.usage, state.responseID, nil
+			return newPrefixReplay(held, pump), QualityDeliver, state.usage, state.responseID, diag, nil
 		}
-		return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, errQualityEmptyStream
+		return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, diag, errQualityEmptyStream
 	}
-	return newPrefixReplay(held, pump), ClassifyQualityHold(signals, cfg.MinOutputTokens), state.usage, state.responseID, nil
+	verdict, reason := ClassifyQualityHoldWithReason(signals, cfg.MinOutputTokens)
+	diag.Reason = reason
+	return newPrefixReplay(held, pump), verdict, state.usage, state.responseID, diag, nil
 }
 
 func newPrefixReplay(held *bytes.Buffer, rest io.ReadCloser) io.ReadCloser {

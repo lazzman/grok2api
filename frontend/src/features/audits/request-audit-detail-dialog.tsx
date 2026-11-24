@@ -357,7 +357,7 @@ function AttemptButton({ attempt, statusCode, selected, onClick }: { attempt: Au
         {t("audits.attemptNumber", { number: attempt.number })}
       </span>
       {statusCode ? (
-        <StatusBadge statusCode={statusCode} failed={attempt.stage === "response_stream"} />
+        <StatusBadge statusCode={statusCode} failed={attempt.stage === "response_stream" || attempt.stage === "quality_hold"} />
       ) : (
         <span className="shrink-0 text-xs text-muted-foreground">—</span>
       )}

@@ -333,8 +333,22 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	// native Responses replay remains account-scoped, while the Chat/Messages
 	// bridge is scoped to the client session, model, and physical plane only;
 	// encrypted reasoning is portable across accounts on that plane.
+	preStrippedEncrypted := false
+	if request.StripReasoningEncryptedContent && len(body) > 0 && request.Method == http.MethodPost {
+		var stripped bool
+		body, stripped = stripReasoningEncryptedContent(body)
+		preStrippedEncrypted = stripped
+	}
 	replayBaseBody := body
-	body, replayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, base)
+	var replayKey string
+	if request.StripReasoningEncryptedContent {
+		replayKey = a.scopedReasoningReplayKey(request, base)
+		if a.replay != nil && replayKey != "" {
+			a.replay.Clear(ctx, request.Model, replayKey)
+		}
+	} else {
+		body, replayKey = a.applyReasoningReplay(ctx, request, replayBaseBody, base)
+	}
 	call := a.doResponseRequest(ctx, request, accessToken, body, base)
 	if call.err != nil {
 		return nil, call.err
@@ -364,7 +378,17 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		} else {
 			fallbackBase := a.fallbackBaseURL()
 			if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
-				fallbackBody, fallbackReplayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, fallbackBase)
+				var fallbackBody []byte
+				var fallbackReplayKey string
+				if request.StripReasoningEncryptedContent {
+					fallbackBody = replayBaseBody
+					fallbackReplayKey = a.scopedReasoningReplayKey(request, fallbackBase)
+					if a.replay != nil && fallbackReplayKey != "" {
+						a.replay.Clear(ctx, request.Model, fallbackReplayKey)
+					}
+				} else {
+					fallbackBody, fallbackReplayKey = a.applyReasoningReplay(ctx, request, replayBaseBody, fallbackBase)
+				}
 				fallbackCtx := infraegress.WithPhysicalCallStage(ctx, "plane_fallback")
 				fallbackCall := a.doResponseRequest(fallbackCtx, request, accessToken, fallbackBody, fallbackBase)
 				fallbackErr := fallbackCall.err
@@ -442,6 +466,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			resp.Header.Set("X-Grok2API-Compatibility-Warnings", warnings)
 		}
 	}
+	if preStrippedEncrypted {
+		reasoningRecovery.encryptedContentDowngraded = true
+	}
 	reasoningRecovery.appendWarnings(resp.Header)
 	if responsesOperation && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if request.Streaming {
@@ -502,15 +529,15 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				if diagnostic == nil {
 					return nil, convertErr
 				}
-				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, ReasoningRecoveryFailed: reasoningRecovery.failed, RecoveredPrimaryFailure: recoveredPrimaryFailure, RecoveredAttempts: recoveredAttempts(recoveredPrimaryAttempt, reasoningRecovery), RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
+				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, ReasoningRecoveryFailed: reasoningRecovery.failed, ReasoningEncryptedContentDowngraded: reasoningRecovery.encryptedContentDowngraded, RecoveredPrimaryFailure: recoveredPrimaryFailure, RecoveredAttempts: recoveredAttempts(recoveredPrimaryAttempt, reasoningRecovery), RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(converted))
 			resp.Header.Set("Content-Length", strconv.Itoa(len(converted)))
 			resp.Header.Set("Content-Type", "application/json")
-			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, ReasoningRecoveryFailed: reasoningRecovery.failed, RecoveredPrimaryFailure: recoveredPrimaryFailure, RecoveredAttempts: recoveredAttempts(recoveredPrimaryAttempt, reasoningRecovery), RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
+			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, ReasoningRecoveryFailed: reasoningRecovery.failed, ReasoningEncryptedContentDowngraded: reasoningRecovery.encryptedContentDowngraded, RecoveredPrimaryFailure: recoveredPrimaryFailure, RecoveredAttempts: recoveredAttempts(recoveredPrimaryAttempt, reasoningRecovery), RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 		}
 	}
-	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: rateLimitDiagnostic, ReasoningRecoveryFailed: reasoningRecovery.failed, RecoveredPrimaryFailure: recoveredPrimaryFailure, RecoveredAttempts: recoveredAttempts(recoveredPrimaryAttempt, reasoningRecovery), RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
+	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: rateLimitDiagnostic, ReasoningRecoveryFailed: reasoningRecovery.failed, ReasoningEncryptedContentDowngraded: reasoningRecovery.encryptedContentDowngraded, RecoveredPrimaryFailure: recoveredPrimaryFailure, RecoveredAttempts: recoveredAttempts(recoveredPrimaryAttempt, reasoningRecovery), RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 }
 
 // recoveredAttempts 按真实调用顺序汇总被 fallback 与 reasoning recovery 隐藏的失败。

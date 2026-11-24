@@ -4335,9 +4335,10 @@ func TestGatewayPinnedResponseReturnsCachedTeamRateLimitWithoutSpinning(t *testi
 }
 
 type scriptedBuildResponse struct {
-	status int
-	body   string
-	header http.Header
+	status                              int
+	body                                string
+	header                              http.Header
+	reasoningEncryptedContentDowngraded bool
 }
 
 type forcedQualityProbeAdapter struct {
@@ -4412,6 +4413,7 @@ type scriptedBuildAdapter struct {
 	mu               sync.Mutex
 	attempts         []uint64
 	transientRetries []int
+	stripEncrypted   []bool
 	responses        map[uint64][]scriptedBuildResponse
 	refreshes        atomic.Int64
 	lastRateLimit    *provider.RateLimitMetadata
@@ -4429,6 +4431,7 @@ func (a *scriptedBuildAdapter) ForwardResponse(_ context.Context, request provid
 	defer a.mu.Unlock()
 	a.attempts = append(a.attempts, request.Credential.ID)
 	a.transientRetries = append(a.transientRetries, request.TransientRetry)
+	a.stripEncrypted = append(a.stripEncrypted, request.StripReasoningEncryptedContent)
 	queue := a.responses[request.Credential.ID]
 	if len(queue) == 0 {
 		return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":"resp-default"}`))}, nil
@@ -4447,6 +4450,7 @@ func (a *scriptedBuildAdapter) ForwardResponse(_ context.Context, request provid
 	return &provider.Response{
 		StatusCode: next.status, Status: http.StatusText(next.status), Header: header,
 		Body: io.NopCloser(strings.NewReader(next.body)), RateLimit: rateLimit,
+		ReasoningEncryptedContentDowngraded: next.reasoningEncryptedContentDowngraded,
 	}, nil
 }
 func (a *scriptedBuildAdapter) RefreshCredential(context.Context, account.Credential) (provider.RefreshedCredential, error) {
@@ -4462,6 +4466,11 @@ func (a *scriptedBuildAdapter) TransientRetries() []int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]int(nil), a.transientRetries...)
+}
+func (a *scriptedBuildAdapter) StripEncrypted() []bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]bool(nil), a.stripEncrypted...)
 }
 
 type systemicForbiddenAdapter struct {

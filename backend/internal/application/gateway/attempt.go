@@ -310,21 +310,25 @@ func (r *failureAttemptRecorder) ensureStreamFailureAttempt(credential accountdo
 	})
 }
 
-func (r *failureAttemptRecorder) captureQualityDegraded(credential accountdomain.Credential, startedAt time.Time) {
+func (r *failureAttemptRecorder) captureQualityDegraded(credential accountdomain.Credential, startedAt time.Time, upstreamURL string, diag QualityPeekDiagnostic) audit.Attempt {
 	status := http.StatusOK
-	r.append(audit.Attempt{
+	attempt := audit.Attempt{
 		Source:             audit.AttemptSourceUpstreamHTTP,
 		Stage:              "quality_hold",
 		AccountID:          auditAccountID(credential.ID),
 		AccountName:        credential.Name,
 		Method:             r.method,
 		RequestPath:        r.path,
+		UpstreamURL:        sanitizeUpstreamURL(upstreamURL),
 		StartedAt:          startedAt.UTC(),
 		DurationMS:         time.Since(startedAt).Milliseconds(),
 		UpstreamStatusCode: &status,
 		UpstreamStatus:     "200 OK",
-		TransportError:     ErrorQualityDegraded,
-	})
+		ResponseBody:       marshalQualityDiagnostic(diag),
+		TransportError:     qualityDiagnosticTransportError(diag.Reason),
+	}
+	r.append(attempt)
+	return attempt
 }
 
 func (r *failureAttemptRecorder) append(attempt audit.Attempt) {

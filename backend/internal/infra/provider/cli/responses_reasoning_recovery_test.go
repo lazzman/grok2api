@@ -791,3 +791,38 @@ func TestRecoverReasoningDecodeFailureKeepsLegacyCompactionMarkerWithoutCompacti
 		t.Fatalf("calls=%d status=%d warnings=%q", calls.Load(), resp.StatusCode, resp.Header.Get("X-Grok2API-Compatibility-Warnings"))
 	}
 }
+
+func TestForwardResponsePreStripsReasoningEncryptedContentWhenFlagSet(t *testing.T) {
+	adapter, encrypted := newReasoningRecoveryTestAdapter(t)
+	var calls atomic.Int32
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		data, _ := io.ReadAll(request.Body)
+		if strings.Contains(string(data), `"encrypted_content"`) {
+			t.Fatalf("pre-stripped request must not contain encrypted_content: %s", data)
+		}
+		if !strings.Contains(string(data), "keep readable summary") {
+			t.Fatalf("pre-stripped request must preserve readable reasoning summary: %s", data)
+		}
+		return jsonHTTPResponse(request, http.StatusOK, `{"id":"resp_ok","status":"completed","output":[]}`), nil
+	})
+	response, err := adapter.ForwardResponse(t.Context(), provider.ResponseResourceRequest{
+		Credential:                     account.Credential{ID: 2, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted},
+		Method:                         http.MethodPost,
+		Path:                           "/responses",
+		Model:                          "grok-4.7",
+		PromptCacheKey:                 "session-prestrip",
+		StripReasoningEncryptedContent: true,
+		Body:                           []byte(`{"model":"grok-4.7","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"keep readable summary"}],"encrypted_content":"old-cipher"},{"role":"user","content":"continue"}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if calls.Load() != 1 || response.StatusCode != http.StatusOK || !response.ReasoningEncryptedContentDowngraded {
+		t.Fatalf("calls=%d status=%d downgraded=%v", calls.Load(), response.StatusCode, response.ReasoningEncryptedContentDowngraded)
+	}
+	if !strings.Contains(response.Header.Get("X-Grok2API-Compatibility-Warnings"), "reasoning_encrypted_content_downgraded") {
+		t.Fatalf("warnings=%q, want reasoning_encrypted_content_downgraded", response.Header.Get("X-Grok2API-Compatibility-Warnings"))
+	}
+}

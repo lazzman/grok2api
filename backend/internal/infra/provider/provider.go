@@ -361,6 +361,9 @@ type ResponseResourceRequest struct {
 	PromptCacheKey string
 	// ReasoningReplayKey comes only from explicit client session identity; soft cache identity must not replay ciphertext.
 	ReasoningReplayKey string
+	// StripReasoningEncryptedContent 指示同一请求在前面账号已遇到上游 400 拒绝解密客户端密文，
+	// 后续换号重试时直接预先剥离不可解密的 encrypted_content，避免每个账号重复白打一次 400。
+	StripReasoningEncryptedContent bool
 	// AllowClientToolCacheRoute allows the Build native cache route to supplement existing client tools.
 	// This is a protocol compatibility signal, not a client authentication result.
 	AllowClientToolCacheRoute bool
@@ -398,6 +401,9 @@ type Response struct {
 	// adapter exhausts same-account recovery for an opaque reasoning 400. Gateway
 	// policy must not infer this state from an upstream-controlled response header.
 	ReasoningRecoveryFailed bool
+	// ReasoningEncryptedContentDowngraded 表示本次调用已确认上游拒绝解码客户端传入的 encrypted_content，
+	// 并通过剥离密文完成降级恢复，供网关在同一请求的后续换号重试中复用。
+	ReasoningEncryptedContentDowngraded bool
 	// RecoveredPrimaryFailure records a primary-plane failure hidden by a successful Provider fallback.
 	RecoveredPrimaryFailure *DiagnosticResponse
 	// RecoveredAttempts 保存被 adapter 内部恢复流程隐藏、但仍需进入请求审计的上游调用。

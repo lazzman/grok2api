@@ -1054,11 +1054,15 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	normalizedMetadata := &provider.NormalizedRequestMetadata{}
 	responseStartedAt := startedAt
 	transientRetry := 0
+	stripReasoningEncryptedContent := false
 	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
 		responseStartedAt = started
 		lease.markSelectorUpstreamStarted()
-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, TransientRetry: transientRetry, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
+		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, StripReasoningEncryptedContent: stripReasoningEncryptedContent, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, TransientRetry: transientRetry, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
+		if response != nil && response.ReasoningEncryptedContentDowngraded {
+			stripReasoningEncryptedContent = true
+		}
 		auditBase.ReasoningEffort = normalizedMetadata.ReasoningEffort
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
@@ -1206,6 +1210,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		lease             *accountLease
 		credential        accountdomain.Credential
 		usage             Usage
+		diagnostic        QualityPeekDiagnostic
 		upstreamStartedAt time.Time
 	}
 	var fallback *qualityFallback
@@ -1214,8 +1219,12 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			return
 		}
 		if recordDegraded {
-			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider)
-			failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt)
+			upstreamURL := ""
+			if fallback.response != nil {
+				upstreamURL = fallback.response.UpstreamURL
+			}
+			attempt := failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt, upstreamURL, fallback.diagnostic)
+			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider, &attempt)
 		}
 		_ = fallback.response.Body.Close()
 		fallback = nil
@@ -1605,7 +1614,7 @@ attemptLoop:
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if qualityHoldEnabled {
-				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				replay, verdict, peekUsage, _, peekDiag, peekErr := peekQualityStreamWithDiagnostic(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
 				if peekErr != nil {
 					if replay != nil {
 						_ = replay.Close()
@@ -1651,14 +1660,14 @@ attemptLoop:
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
-					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
-					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
+					attempt := failureAttempts.captureQualityDegraded(credential, responseStartedAt, response.UpstreamURL, peekDiag)
+					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider, &attempt)
 				}
 				switch commit.Action {
 				case QualityActionRetry:
 					if deferFailOpenAudit {
 						discardFallback(true)
-						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peekUsage, upstreamStartedAt: responseStartedAt}
+						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peekUsage, diagnostic: peekDiag, upstreamStartedAt: responseStartedAt}
 						lease.completeSelectorObservation(true)
 						lease.Release()
 					} else {
@@ -1671,7 +1680,7 @@ attemptLoop:
 						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
 						Cause: errQualityDegraded,
 					}
-					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					s.logger.Info("quality_degraded_retry", append([]any{"request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "usage_output_tokens", peekUsage.OutputTokens}, qualityDiagnosticLogAttrs(peekDiag)...)...)
 					continue
 				case QualityActionReject:
 					_ = response.Body.Close()
@@ -1682,11 +1691,11 @@ attemptLoop:
 						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
 						Cause: errQualityDegraded,
 					}
-					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
+					s.logger.Info("quality_degraded_rejected", append([]any{"request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "usage_output_tokens", peekUsage.OutputTokens}, qualityDiagnosticLogAttrs(peekDiag)...)...)
 					break attemptLoop
 				case QualityActionDeliverLast:
 					discardFallback(true)
-					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					s.logger.Info("quality_degraded_deliver_last", append([]any{"request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "usage_output_tokens", peekUsage.OutputTokens}, qualityDiagnosticLogAttrs(peekDiag)...)...)
 				case QualityActionDeliver:
 					discardFallback(true)
 				}
@@ -1712,7 +1721,7 @@ attemptLoop:
 			lease.Release()
 			selected := fallback
 			fallback = nil
-			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
+			s.logger.Info("quality_degraded_fallback", append([]any{"request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts}, qualityDiagnosticLogAttrs(selected.diagnostic)...)...)
 			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
 		}
 		return handoffResponse(response, lease, credential, responseStartedAt), nil
@@ -1721,7 +1730,7 @@ attemptLoop:
 		if ctx.Err() == nil && holdCfg.OnExhausted == qualityRetryFailOpen {
 			selected := fallback
 			fallback = nil
-			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
+			s.logger.Info("quality_degraded_fallback", append([]any{"request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts}, qualityDiagnosticLogAttrs(selected.diagnostic)...)...)
 			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
 		}
 		discardFallback(true)
