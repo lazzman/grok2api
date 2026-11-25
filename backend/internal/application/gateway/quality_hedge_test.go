@@ -20,9 +20,9 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	inferencedomain "github.com/chenyme/grok2api/backend/internal/domain/inference"
-	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 )
 
 type hedgeScriptedAdapter struct {
@@ -242,7 +242,7 @@ func TestHedgeStaggeredWinnerDeliversAndShadowCatchesDegradedPrimary(t *testing.
 		[]hedgeTestAccountSpec{{name: "silent-degraded-1"}, {name: "healthy-2"}},
 		QualityRetryRuntime{
 			Enabled: true, MaxAttempts: 3, MinOutputTokens: 8,
-			HoldTimeout: 160 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HoldTimeout: 350 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
 			AutoDisable: true, HedgeEnabled: true, HedgeDelay: 40 * time.Millisecond, HedgeMaxConcurrent: 2,
 		},
 		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
@@ -279,8 +279,8 @@ func TestHedgeStaggeredWinnerDeliversAndShadowCatchesDegradedPrimary(t *testing.
 		t.Fatal(err)
 	}
 	elapsed := time.Since(started)
-	if elapsed >= 140*time.Millisecond {
-		t.Fatalf("winner should deliver right after hedgeDelay (~40ms) without waiting holdTimeout (160ms), got %s", elapsed)
+	if elapsed >= 250*time.Millisecond {
+		t.Fatalf("winner should deliver right after hedgeDelay (~40ms) without waiting holdTimeout (350ms), got %s", elapsed)
 	}
 	body, _ := io.ReadAll(res.Body)
 	res.Finalize(Usage{Reported: true, InputTokens: 100, OutputTokens: 40, ReasoningTokens: 20}, "resp-win-2", "")
@@ -345,15 +345,29 @@ func TestHedgeStaggeredWinnerDeliversAndShadowCatchesDegradedPrimary(t *testing.
 	}
 }
 
+type hedgeCloseTrackingReadCloser struct {
+	io.ReadCloser
+	closed *atomic.Bool
+}
+
+func (c *hedgeCloseTrackingReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	if c.closed != nil {
+		c.closed.Store(true)
+	}
+	return err
+}
+
 func TestHedgeShadowHealthySlowPrimaryIsClosedWithoutPenalty(t *testing.T) {
 	ctx := context.Background()
-	var primaryClosed atomic.Bool
+	var primaryBodyClosed atomic.Bool
+	primaryProducerDone := make(chan struct{})
 	service, accounts, audits, creds, key, _ := setupHedgeGatewayTest(
 		t,
 		[]hedgeTestAccountSpec{{name: "slow-healthy-1"}, {name: "fast-2"}},
 		QualityRetryRuntime{
 			Enabled: true, MaxAttempts: 3, MinOutputTokens: 8,
-			HoldTimeout: 400 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HoldTimeout: 600 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
 			AutoDisable: true, HedgeEnabled: true, HedgeDelay: 30 * time.Millisecond, HedgeMaxConcurrent: 2,
 		},
 		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
@@ -361,8 +375,8 @@ func TestHedgeShadowHealthySlowPrimaryIsClosedWithoutPenalty(t *testing.T) {
 				reader, writer := io.Pipe()
 				go func() {
 					defer func() {
-						primaryClosed.Store(true)
 						_ = writer.Close()
+						close(primaryProducerDone)
 					}()
 					_, _ = io.WriteString(writer, sse(`data: {"type":"response.created","response":{"id":"resp-slow-ok","model":"grok-4.7"}}`))
 					select {
@@ -373,7 +387,8 @@ func TestHedgeShadowHealthySlowPrimaryIsClosedWithoutPenalty(t *testing.T) {
 					<-bctx.Done()
 				}()
 				return &provider.Response{
-					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: reader,
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+					Body: &hedgeCloseTrackingReadCloser{ReadCloser: reader, closed: &primaryBodyClosed},
 				}, nil
 			},
 			1: func(_ context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
@@ -400,8 +415,13 @@ func TestHedgeShadowHealthySlowPrimaryIsClosedWithoutPenalty(t *testing.T) {
 
 	service.WaitShadowQualityProbes()
 
-	if !primaryClosed.Load() {
+	if !primaryBodyClosed.Load() {
 		t.Fatal("shadow healthy branch stream must be closed immediately once thinking plaintext arrives")
+	}
+	select {
+	case <-primaryProducerDone:
+	case <-time.After(time.Second):
+		t.Fatal("shadow healthy branch context must be canceled once thinking plaintext arrives")
 	}
 	acc1, err := accounts.Get(ctx, creds[0].ID)
 	if err != nil {
@@ -429,8 +449,8 @@ func TestHedgeEarlyFailureLaunchesNextImmediatelyWithoutWaitingHedgeDelay(t *tes
 		[]hedgeTestAccountSpec{{name: "rate-limited-1"}, {name: "ok-2"}},
 		QualityRetryRuntime{
 			Enabled: true, MaxAttempts: 3, MinOutputTokens: 8,
-			HoldTimeout: 500 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
-			HedgeEnabled: true, HedgeDelay: 400 * time.Millisecond, HedgeMaxConcurrent: 2,
+			HoldTimeout: 600 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HedgeEnabled: true, HedgeDelay: 600 * time.Millisecond, HedgeMaxConcurrent: 2,
 		},
 		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
 			0: func(_ context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
@@ -459,8 +479,8 @@ func TestHedgeEarlyFailureLaunchesNextImmediatelyWithoutWaitingHedgeDelay(t *tes
 	_, _ = io.ReadAll(res.Body)
 	res.Finalize(Usage{Reported: true, OutputTokens: 40, ReasoningTokens: 20}, "resp-ok-2", "")
 	_ = res.Body.Close()
-	if elapsed >= 200*time.Millisecond {
-		t.Fatalf("early 429 must immediately launch account 2 without waiting 400ms hedgeDelay, got %s", elapsed)
+	if elapsed >= 300*time.Millisecond {
+		t.Fatalf("early 429 must immediately launch account 2 without waiting 600ms hedgeDelay, got %s", elapsed)
 	}
 	if launched := adapter.Launched(); len(launched) != 2 || launched[0] != creds[0].ID || launched[1] != creds[1].ID {
 		t.Fatalf("launched = %v, want [%d %d]", launched, creds[0].ID, creds[1].ID)
@@ -699,4 +719,131 @@ func TestHedgeSingleAccountPoolWaitsAndDeliversNormally(t *testing.T) {
 	if launched := adapter.Launched(); len(launched) != 1 || launched[0] != creds[0].ID {
 		t.Fatalf("launched = %v, want [%d]", launched, creds[0].ID)
 	}
+}
+
+func TestHedgeWinnerStreamSurvivesHandoffUntilEOFAndClosesBranchCtxOnClose(t *testing.T) {
+	ctx := context.Background()
+	allowTail := make(chan struct{})
+	branchCtxDone := make(chan struct{})
+	var canceledBeforeTail atomic.Bool
+
+	service, _, _, _, key, _ := setupHedgeGatewayTest(
+		t,
+		[]hedgeTestAccountSpec{{name: "stream-winner-1"}, {name: "backup-2"}},
+		QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			HoldTimeout: 500 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HedgeEnabled: true, HedgeDelay: 300 * time.Millisecond, HedgeMaxConcurrent: 2,
+		},
+		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
+			0: func(bctx context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				reader, writer := io.Pipe()
+				go func() {
+					defer writer.Close()
+					_, _ = io.WriteString(writer, sse(
+						`data: {"type":"response.created","response":{"id":"resp-stream","model":"grok-4.7"}}`,
+						`data: {"type":"response.reasoning_summary_text.delta","delta":"real reasoning"}`,
+					))
+					select {
+					case <-bctx.Done():
+						canceledBeforeTail.Store(true)
+						_ = writer.CloseWithError(bctx.Err())
+						return
+					case <-allowTail:
+					}
+					if bctx.Err() != nil {
+						canceledBeforeTail.Store(true)
+						_ = writer.CloseWithError(bctx.Err())
+						return
+					}
+					_, _ = io.WriteString(writer, sse(
+						`data: {"type":"response.output_text.delta","delta":"tail-after-handoff"}`,
+						`data: {"type":"response.completed","response":{"id":"resp-stream","model":"grok-4.7","usage":{"input_tokens":50,"output_tokens":30,"output_tokens_details":{"reasoning_tokens":15}}}}`,
+					))
+				}()
+				go func() {
+					<-bctx.Done()
+					close(branchCtxDone)
+				}()
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: reader,
+				}, nil
+			},
+		},
+	)
+
+	res, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-hedge-stream-survive", ClientKey: key, PublicModel: "grok-4.7", Streaming: true,
+		Body: []byte(`{"model":"grok-4.7","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(allowTail)
+	body, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		t.Fatalf("reading handed-off winner stream failed: %v", readErr)
+	}
+	if canceledBeforeTail.Load() {
+		t.Fatal("winner branch context must stay alive until response body closes")
+	}
+	if !strings.Contains(string(body), "tail-after-handoff") {
+		t.Fatalf("expected post-handoff stream chunks, got: %s", body)
+	}
+	res.Finalize(Usage{Reported: true, OutputTokens: 30, ReasoningTokens: 15}, "resp-stream", "")
+	_ = res.Body.Close()
+
+	select {
+	case <-branchCtxDone:
+	case <-time.After(time.Second):
+		t.Fatal("winner branch context must be canceled once response body is closed")
+	}
+}
+
+func TestHedgeWinnerStreamCancelsUpstreamWhenClientDisconnectsAfterHandoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	upstreamAborted := make(chan struct{})
+
+	service, _, _, _, key, _ := setupHedgeGatewayTest(
+		t,
+		[]hedgeTestAccountSpec{{name: "stream-disconnect-1"}, {name: "backup-2"}},
+		QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			HoldTimeout: 500 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HedgeEnabled: true, HedgeDelay: 300 * time.Millisecond, HedgeMaxConcurrent: 2,
+		},
+		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
+			0: func(bctx context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				reader, writer := io.Pipe()
+				go func() {
+					defer close(upstreamAborted)
+					_, _ = io.WriteString(writer, sse(
+						`data: {"type":"response.created","response":{"id":"resp-disc","model":"grok-4.7"}}`,
+						`data: {"type":"response.reasoning_summary_text.delta","delta":"real reasoning"}`,
+					))
+					<-bctx.Done()
+					_ = writer.CloseWithError(bctx.Err())
+				}()
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: reader,
+				}, nil
+			},
+		},
+	)
+
+	res, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-hedge-client-disconnect", ClientKey: key, PublicModel: "grok-4.7", Streaming: true,
+		Body: []byte(`{"model":"grok-4.7","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-upstreamAborted:
+	case <-time.After(time.Second):
+		t.Fatal("client disconnect after handoff must cancel winning branch upstream context")
+	}
+	_ = res.Body.Close()
 }

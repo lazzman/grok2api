@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
@@ -43,15 +44,15 @@ type hedgeResponseParams struct {
 }
 
 type hedgeBranch struct {
-	id                int
-	lease             *accountLease
-	credential        accountdomain.Credential
-	branchCtx         context.Context
-	branchCancel      context.CancelFunc
-	idempotencyID     string
-	stripEncrypted    bool
-	transientRetry    int
-	startedAt         time.Time
+	id             int
+	lease          *accountLease
+	credential     accountdomain.Credential
+	branchCtx      context.Context
+	branchCancel   context.CancelFunc
+	idempotencyID  string
+	stripEncrypted bool
+	transientRetry int
+	startedAt      time.Time
 }
 
 type hedgeBranchOutcomeKind string
@@ -91,6 +92,43 @@ type hedgeFallback struct {
 	diagnostic        QualityPeekDiagnostic
 	egressTrace       *infraegress.Trace
 	upstreamStartedAt time.Time
+	branchCancel      context.CancelFunc
+}
+
+type hedgeResponseBodyLifecycle struct {
+	io.ReadCloser
+	closeOnce sync.Once
+	onClose   func()
+}
+
+func (r *hedgeResponseBodyLifecycle) Close() error {
+	err := r.ReadCloser.Close()
+	r.closeOnce.Do(func() {
+		if r.onClose != nil {
+			r.onClose()
+		}
+	})
+	return err
+}
+
+// bindHedgeResponseLifecycle 将交付给客户端的分支上下文重新绑定到客户端请求 ctx 与响应流 Close：
+// 避免交付瞬间提前取消 branchCtx 掐断真实上游 HTTP 流，同时保证客户端断连或流关闭时释放上游连接。
+func bindHedgeResponseLifecycle(ctx context.Context, response *provider.Response, branchCancel context.CancelFunc) {
+	if branchCancel == nil {
+		return
+	}
+	if response == nil || response.Body == nil {
+		branchCancel()
+		return
+	}
+	stopWatch := context.AfterFunc(ctx, branchCancel)
+	response.Body = &hedgeResponseBodyLifecycle{
+		ReadCloser: response.Body,
+		onClose: func() {
+			stopWatch()
+			branchCancel()
+		},
+	}
 }
 
 // createHedgedResponse 以阶梯分时并发调度多个账号：
@@ -140,6 +178,9 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 		}
 		if fallback.response != nil && fallback.response.Body != nil {
 			_ = fallback.response.Body.Close()
+		}
+		if fallback.branchCancel != nil {
+			fallback.branchCancel()
 		}
 		fallback = nil
 	}
@@ -325,7 +366,6 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 			switch outcome.kind {
 			case hedgeOutcomeDeliver:
 				stopHedgeTimer()
-				outcome.branch.branchCancel()
 				discardFallback(true)
 				if outcome.normalizedEffort != "" {
 					p.auditBase.ReasoningEffort = outcome.normalizedEffort
@@ -337,20 +377,20 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 				if len(inFlight) > 0 {
 					s.spawnHedgeShadowReaper(inFlight, outcomeCh, p, *p.auditBase)
 				}
+				bindHedgeResponseLifecycle(ctx, outcome.response, outcome.branch.branchCancel)
 				return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace), nil
 
 			case hedgeOutcomeTerminalClient:
 				stopHedgeTimer()
-				outcome.branch.branchCancel()
 				cancelAndDrainAll()
 				discardFallback(true)
 				if outcome.normalizedEffort != "" {
 					p.auditBase.ReasoningEffort = outcome.normalizedEffort
 				}
+				bindHedgeResponseLifecycle(ctx, outcome.response, outcome.branch.branchCancel)
 				return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace), nil
 
 			case hedgeOutcomeWithhold:
-				outcome.branch.branchCancel()
 				s.applyMissingThinkingPenalty(ctx, p.input.RequestID, outcome.credential, p.holdCfg.AccountCooldown, p.holdCfg.AutoDisable)
 				hasMore := len(inFlight) > 0 || (qualityAccountAttempts < maxTotal && !selectionExhausted && selection != nil && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted))
 				if !hasMore && p.holdCfg.OnExhausted == qualityRetryFailOpen {
@@ -360,6 +400,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 						p.auditBase.ReasoningEffort = outcome.normalizedEffort
 					}
 					s.logger.Info("quality_degraded_deliver_last", append([]any{"request_id", p.input.RequestID, "account_id", outcome.credential.ID, "quality_attempt", qualityAccountAttempts, "usage_output_tokens", outcome.usage.OutputTokens}, qualityDiagnosticLogAttrs(outcome.diagnostic)...)...)
+					bindHedgeResponseLifecycle(ctx, outcome.response, outcome.branch.branchCancel)
 					return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace), nil
 				}
 				if hasMore && p.holdCfg.OnExhausted == qualityRetryFailOpen {
@@ -372,6 +413,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 						diagnostic:        outcome.diagnostic,
 						egressTrace:       outcome.egressTrace,
 						upstreamStartedAt: outcome.upstreamStartedAt,
+						branchCancel:      outcome.branch.branchCancel,
 					}
 					outcome.branch.lease.completeSelectorObservation(true)
 					outcome.branch.lease.Release()
@@ -385,6 +427,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 					if outcome.response != nil && outcome.response.Body != nil {
 						_ = outcome.response.Body.Close()
 					}
+					outcome.branch.branchCancel()
 					outcome.branch.lease.Release()
 				}
 				lastErr = errQualityDegraded
@@ -434,6 +477,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 			selected := fallback
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", append([]any{"request_id", p.input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts}, qualityDiagnosticLogAttrs(selected.diagnostic)...)...)
+			bindHedgeResponseLifecycle(ctx, selected.response, selected.branchCancel)
 			return p.handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, selected.egressTrace), nil
 		}
 		discardFallback(true)
