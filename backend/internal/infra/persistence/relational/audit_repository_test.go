@@ -656,4 +656,85 @@ func TestAuditRepositoryPurgeOlderThanBatchesAuditsAndAttempts(t *testing.T) {
 	}
 }
 
+func TestAuditRepositoryAppendAttemptsByEventID(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-append-attempts.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewAuditRepository(database)
+	now := time.Now().UTC()
+	status200 := http.StatusOK
+	status429 := http.StatusTooManyRequests
+	if err := repo.Create(ctx, audit.Record{
+		EventID: "evt_append_attempt_0001", RequestID: "req-append-1", ClientKeyID: 1, ModelRouteID: 1,
+		StatusCode: status200, Streaming: true, CreatedAt: now,
+		Attempts: []audit.Attempt{{
+			Number: 1, HedgeBranch: 1, Source: audit.AttemptSourceUpstreamHTTP, Stage: "quality_peek_error",
+			AccountID: uint64Pointer(10), AccountName: "branch-1", StartedAt: now, UpstreamStatusCode: &status200,
+			TransportError: "quality_peek_error: 上游流式响应为空",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repo.AppendAttemptsByEventID(ctx, "evt_append_attempt_0001", []audit.Attempt{
+		{
+			HedgeBranch: 2, Source: audit.AttemptSourceUpstreamHTTP, Stage: "hedge_shadow_degraded",
+			AccountID: uint64Pointer(20), AccountName: "branch-2", StartedAt: now.Add(time.Second),
+			UpstreamStatusCode: &status200, TransportError: "quality_degraded: missing_thinking_hold_expired",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AppendAttemptsByEventID(ctx, "evt_append_attempt_0001", []audit.Attempt{
+		{
+			HedgeBranch: 3, Source: audit.AttemptSourceUpstreamHTTP, Stage: "hedge_shadow:upstream_response",
+			AccountID: uint64Pointer(30), AccountName: "branch-3", StartedAt: now.Add(2 * time.Second),
+			UpstreamStatusCode: &status429,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	logs, total, err := repo.List(ctx, 0, 10)
+	if err != nil || total != 1 || len(logs) != 1 {
+		t.Fatalf("list failed: err=%v total=%d logs=%#v", err, total, logs)
+	}
+	if logs[0].AttemptCount != 3 {
+		t.Fatalf("attempt_count = %d, want 3", logs[0].AttemptCount)
+	}
+	detail, err := repo.Get(ctx, logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.AttemptCount != 3 || len(detail.Attempts) != 3 {
+		t.Fatalf("detail attempts = %d/%d", detail.AttemptCount, len(detail.Attempts))
+	}
+	for index, want := range []struct {
+		number int
+		branch int
+		stage  string
+	}{
+		{1, 1, "quality_peek_error"},
+		{2, 2, "hedge_shadow_degraded"},
+		{3, 3, "hedge_shadow:upstream_response"},
+	} {
+		got := detail.Attempts[index]
+		if got.Number != want.number || got.HedgeBranch != want.branch || got.Stage != want.stage {
+			t.Fatalf("attempt[%d] = %#v, want number=%d branch=%d stage=%s", index, got, want.number, want.branch, want.stage)
+		}
+	}
+
+	if err := repo.AppendAttemptsByEventID(ctx, "evt_append_missing_9999", []audit.Attempt{{
+		Source: audit.AttemptSourceTransport, Stage: "hedge_shadow_canceled", StartedAt: now,
+	}}); !errors.Is(err, repositorypkg.ErrNotFound) {
+		t.Fatalf("missing event_id err = %v, want ErrNotFound", err)
+	}
+}
+
 func uint64Pointer(value uint64) *uint64 { return &value }

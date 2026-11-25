@@ -174,6 +174,10 @@ type auditRecorder interface {
 	Create(ctx context.Context, value audit.Record) error
 }
 
+type auditAttemptAppender interface {
+	AppendAttemptsByEventID(ctx context.Context, eventID string, attempts []audit.Attempt) error
+}
+
 type ledgerReadinessChecker interface {
 	CheckLedgerReady() error
 }
@@ -1105,7 +1109,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timing.markCredential(time.Since(started))
 		return result, err
 	}
-	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, activeTrace *infraegress.Trace) *Result {
+	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, activeTrace *infraegress.Trace, hedgeBranch int) *Result {
 		accountID := credential.ID
 		var once sync.Once
 		finalize := func(usage Usage, responseID, errorCode string) {
@@ -1162,11 +1166,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				record.DurationMS = time.Since(startedAt).Milliseconds()
 				record.ErrorCode = errorCode
 				if !successful && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-					failureAttempts.ensureStreamFailureAttempt(credential, upstreamStartedAt, response, errorCode)
-				}
-				attempts := failureAttempts.snapshot()
-				if !successful || len(attempts) > 0 {
-					record.Attempts = attempts
+					failureAttempts.ensureStreamFailureAttemptForBranch(hedgeBranch, credential, upstreamStartedAt, response, errorCode)
 				}
 				record.CreatedAt = now
 				traceForAudit := activeTrace
@@ -1203,10 +1203,20 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 						}
 					}
 				}
+				attempts := failureAttempts.sealAndSnapshot()
+				if !successful || len(attempts) > 0 {
+					record.Attempts = attempts
+				}
+				auditCommitted := false
+				defer func() {
+					failureAttempts.markCommitted(auditCommitted)
+				}()
 				if err := budget.run("audit", finalizationAuditBudget, func(stageCtx context.Context) error {
 					return s.audits.Create(stageCtx, record)
 				}); err != nil {
 					s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
+				} else {
+					auditCommitted = true
 				}
 				if usage.ResponseModel != "" {
 					_ = budget.run("observed_model", finalizationMetadataBudget, func(stageCtx context.Context) error {
@@ -1227,7 +1237,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		}
 		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody}
 		recordStreamFailure := func(diagnostic StreamFailureDiagnostic) {
-			failureAttempts.captureStreamFailure(credential, upstreamStartedAt, response, diagnostic)
+			failureAttempts.captureStreamFailureForBranch(hedgeBranch, credential, upstreamStartedAt, response, diagnostic)
 		}
 		var markFirstToken func()
 		if firstToken != nil {
@@ -1683,6 +1693,7 @@ attemptLoop:
 						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), peekErr)}
 						break
 					}
+					failureAttempts.captureQualityPeekError(credential, responseStartedAt, response, peekDiag, peekErr, 0)
 					lastFailure = newTransportUpstreamFailure(peekErr, credential.ID, credential.Name)
 					if neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) || neterrorpkg.IsUpstreamStreamIdleTimeout(context.Cause(ctx)) || errors.Is(peekErr, errQualityEmptyStream) {
 						logPrefix := "quality_peek_idle"
@@ -1778,16 +1789,16 @@ attemptLoop:
 			selected := fallback
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", append([]any{"request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts}, qualityDiagnosticLogAttrs(selected.diagnostic)...)...)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, egressTrace), nil
+			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, egressTrace, 0), nil
 		}
-		return handoffResponse(response, lease, credential, responseStartedAt, egressTrace), nil
+		return handoffResponse(response, lease, credential, responseStartedAt, egressTrace, 0), nil
 	}
 	if fallback != nil {
 		if ctx.Err() == nil && holdCfg.OnExhausted == qualityRetryFailOpen {
 			selected := fallback
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", append([]any{"request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts}, qualityDiagnosticLogAttrs(selected.diagnostic)...)...)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, egressTrace), nil
+			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, egressTrace, 0), nil
 		}
 		discardFallback(true)
 	}

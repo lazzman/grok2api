@@ -23,6 +23,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 type hedgeScriptedAdapter struct {
@@ -315,29 +316,46 @@ func TestHedgeStaggeredWinnerDeliversAndShadowCatchesDegradedPrimary(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	var degradedID uint64
+	var winnerID, degradedID uint64
 	normalCount := 0
 	for _, row := range logs {
 		if row.ErrorCode == ErrorQualityDegraded && row.AccountID != nil && *row.AccountID == creds[0].ID {
 			degradedID = row.ID
 		}
 		if row.ErrorCode == "" {
+			winnerID = row.ID
 			normalCount++
 		}
 	}
-	if normalCount != 1 || degradedID == 0 {
+	if normalCount != 1 || winnerID == 0 || degradedID == 0 {
 		t.Fatalf("expected 1 normal audit (winner) and 1 shadow degraded audit, logs=%#v", logs)
 	}
 	detail, err := audits.Get(ctx, degradedID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(detail.Attempts) != 1 || detail.Attempts[0].TransportError != "quality_degraded: missing_thinking_hold_expired" {
+	if len(detail.Attempts) != 1 || detail.Attempts[0].Stage != attemptStageHedgeShadowDegraded || detail.Attempts[0].HedgeBranch != 1 || detail.Attempts[0].TransportError != "quality_degraded: missing_thinking_hold_expired" {
 		t.Fatalf("shadow degraded attempt mismatch: %#v", detail.Attempts)
 	}
 	var parsed QualityPeekDiagnostic
 	if err := json.Unmarshal(detail.Attempts[0].ResponseBody, &parsed); err != nil || parsed.Reason != QualityWithholdMissingThinkingExpire {
 		t.Fatalf("shadow diagnostic mismatch: err=%v parsed=%#v", err, parsed)
+	}
+	// 主请求（绿色 200 胜出记录）的上游诊断也必须聚合到影子降智分支。
+	winnerDetail, err := audits.Get(ctx, winnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winnerDetail.AttemptCount != 1 || len(winnerDetail.Attempts) != 1 {
+		t.Fatalf("winner audit must aggregate shadow degraded attempt: count=%d attempts=%#v", winnerDetail.AttemptCount, winnerDetail.Attempts)
+	}
+	shadowInWinner := winnerDetail.Attempts[0]
+	if shadowInWinner.HedgeBranch != 1 || shadowInWinner.Stage != attemptStageHedgeShadowDegraded || shadowInWinner.AccountID == nil || *shadowInWinner.AccountID != creds[0].ID || shadowInWinner.TransportError != "quality_degraded: missing_thinking_hold_expired" {
+		t.Fatalf("winner shadow degraded attempt mismatch: %#v", shadowInWinner)
+	}
+	var winnerParsed QualityPeekDiagnostic
+	if err := json.Unmarshal(shadowInWinner.ResponseBody, &winnerParsed); err != nil || winnerParsed.Reason != QualityWithholdMissingThinkingExpire {
+		t.Fatalf("winner shadow diagnostic mismatch: err=%v parsed=%#v", err, winnerParsed)
 	}
 	logText := logBuf.String()
 	if !strings.Contains(logText, `"msg":"quality_hedge_shadow_degraded"`) || !strings.Contains(logText, `"hedge_shadow":true`) {
@@ -436,6 +454,21 @@ func TestHedgeShadowHealthySlowPrimaryIsClosedWithoutPenalty(t *testing.T) {
 	}
 	if len(logs) != 1 || logs[0].ErrorCode != "" || logs[0].AccountID == nil || *logs[0].AccountID != creds[1].ID {
 		t.Fatalf("healthy shadow branch must not write degraded or duplicate audit, logs=%#v", logs)
+	}
+	winnerDetail, err := audits.Get(ctx, logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winnerDetail.AttemptCount != 1 || len(winnerDetail.Attempts) != 1 {
+		t.Fatalf("winner audit must aggregate healthy shadow attempt: count=%d attempts=%#v", winnerDetail.AttemptCount, winnerDetail.Attempts)
+	}
+	healthyAttempt := winnerDetail.Attempts[0]
+	if healthyAttempt.HedgeBranch != 1 || healthyAttempt.Stage != attemptStageHedgeShadowHealthy || healthyAttempt.AccountID == nil || *healthyAttempt.AccountID != creds[0].ID || healthyAttempt.TransportError != "" {
+		t.Fatalf("winner healthy shadow attempt mismatch: %#v", healthyAttempt)
+	}
+	var healthyDiag QualityPeekDiagnostic
+	if err := json.Unmarshal(healthyAttempt.ResponseBody, &healthyDiag); err != nil || !healthyDiag.Signals.HasReasoningDelta {
+		t.Fatalf("winner healthy shadow diagnostic mismatch: err=%v diag=%#v", err, healthyDiag)
 	}
 	if !strings.Contains(logBuf.String(), `"msg":"quality_hedge_shadow_healthy"`) {
 		t.Fatalf("expected shadow healthy log, got:\n%s", logBuf.String())
@@ -540,7 +573,7 @@ func TestHedgePrefersDifferentTeamAndEgressNode(t *testing.T) {
 func TestHedgeShadowSlotSaturationCancelsLoserWithoutPenalty(t *testing.T) {
 	ctx := context.Background()
 	var primaryCanceled atomic.Bool
-	service, accounts, _, creds, key, _ := setupHedgeGatewayTest(
+	service, accounts, audits, creds, key, _ := setupHedgeGatewayTest(
 		t,
 		[]hedgeTestAccountSpec{{name: "slow-1"}, {name: "fast-2"}},
 		QualityRetryRuntime{
@@ -593,6 +626,21 @@ func TestHedgeShadowSlotSaturationCancelsLoserWithoutPenalty(t *testing.T) {
 	}
 	if !acc1.Enabled || acc1.LastError != "" || acc1.CooldownUntil != nil {
 		t.Fatalf("canceled branch must not be penalized when shadow slots are full: %#v", acc1)
+	}
+	logs, _, err := audits.List(ctx, 0, 10)
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected 1 winner audit, err=%v logs=%#v", err, logs)
+	}
+	detail, err := audits.Get(ctx, logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.AttemptCount != 1 || len(detail.Attempts) != 1 {
+		t.Fatalf("winner audit must record shadow canceled branch: count=%d attempts=%#v", detail.AttemptCount, detail.Attempts)
+	}
+	attempt := detail.Attempts[0]
+	if attempt.HedgeBranch != 1 || attempt.Stage != attemptStageHedgeShadowCanceled || attempt.TransportError != "hedge_shadow_slot_full" {
+		t.Fatalf("shadow slot full attempt mismatch: %#v", attempt)
 	}
 }
 
@@ -846,4 +894,211 @@ func TestHedgeWinnerStreamCancelsUpstreamWhenClientDisconnectsAfterHandoff(t *te
 		t.Fatal("client disconnect after handoff must cancel winning branch upstream context")
 	}
 	_ = res.Body.Close()
+}
+
+func TestHedgeShadowFinishesBeforeMainFinalizeAggregatesInMemory(t *testing.T) {
+	ctx := context.Background()
+	service, _, audits, creds, key, _ := setupHedgeGatewayTest(
+		t,
+		[]hedgeTestAccountSpec{{name: "shadow-first-1"}, {name: "winner-slow-finalize-2"}},
+		QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			HoldTimeout: 500 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HedgeEnabled: true, HedgeDelay: 25 * time.Millisecond, HedgeMaxConcurrent: 2,
+		},
+		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
+			0: func(bctx context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				reader, writer := io.Pipe()
+				go func() {
+					defer writer.Close()
+					_, _ = io.WriteString(writer, sse(`data: {"type":"response.created","response":{"id":"resp-b1","model":"grok-4.7"}}`))
+					select {
+					case <-time.After(60 * time.Millisecond):
+						_, _ = io.WriteString(writer, sse(`data: {"type":"response.reasoning_summary_text.delta","delta":"delayed thinking"}`))
+					case <-bctx.Done():
+					}
+					<-bctx.Done()
+				}()
+				return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: reader}, nil
+			},
+			1: func(_ context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+					Body: io.NopCloser(strings.NewReader(goodPlaintextSSE("resp-b2", "winner-body"))),
+				}, nil
+			},
+		},
+	)
+
+	res, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-hedge-shadow-before-finalize", ClientKey: key, PublicModel: "grok-4.7", Streaming: true,
+		Body: []byte(`{"model":"grok-4.7","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟主请求流式输出较慢：先等影子质检跑完，再调用主请求 Finalize。
+	service.WaitShadowQualityProbes()
+	_, _ = io.ReadAll(res.Body)
+	res.Finalize(Usage{Reported: true, OutputTokens: 40, ReasoningTokens: 20}, "resp-b2", "")
+	_ = res.Body.Close()
+
+	logs, _, err := audits.List(ctx, 0, 10)
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected 1 winner audit, err=%v logs=%#v", err, logs)
+	}
+	detail, err := audits.Get(ctx, logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.AttemptCount != 1 || len(detail.Attempts) != 1 {
+		t.Fatalf("expected 1 in-memory aggregated shadow attempt, got count=%d attempts=%#v", detail.AttemptCount, detail.Attempts)
+	}
+	if detail.Attempts[0].HedgeBranch != 1 || detail.Attempts[0].Stage != attemptStageHedgeShadowHealthy || detail.Attempts[0].AccountID == nil || *detail.Attempts[0].AccountID != creds[0].ID {
+		t.Fatalf("shadow attempt mismatch: %#v", detail.Attempts[0])
+	}
+}
+
+func TestHedgePreHandoffPeekErrorAggregatesWithBranch(t *testing.T) {
+	ctx := context.Background()
+	service, _, audits, creds, key, _ := setupHedgeGatewayTest(
+		t,
+		[]hedgeTestAccountSpec{{name: "empty-peek-1"}, {name: "healthy-2"}},
+		QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			HoldTimeout: 500 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HedgeEnabled: true, HedgeDelay: 300 * time.Millisecond, HedgeMaxConcurrent: 2,
+		},
+		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
+			0: func(_ context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+					UpstreamURL: "https://build.example/v1/responses",
+					Body:        io.NopCloser(strings.NewReader("")),
+				}, nil
+			},
+			1: func(_ context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+					Body: io.NopCloser(strings.NewReader(goodPlaintextSSE("resp-ok-2", "recovered"))),
+				}, nil
+			},
+		},
+	)
+
+	res, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-hedge-peek-err", ClientKey: key, PublicModel: "grok-4.7", Streaming: true,
+		Body: []byte(`{"model":"grok-4.7","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(res.Body)
+	res.Finalize(Usage{Reported: true, OutputTokens: 40, ReasoningTokens: 20}, "resp-ok-2", "")
+	_ = res.Body.Close()
+	service.WaitShadowQualityProbes()
+
+	logs, _, err := audits.List(ctx, 0, 10)
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected 1 winner audit, err=%v logs=%#v", err, logs)
+	}
+	detail, err := audits.Get(ctx, logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.AttemptCount != 1 || len(detail.Attempts) != 1 {
+		t.Fatalf("expected 1 peekErr attempt aggregated, got count=%d attempts=%#v", detail.AttemptCount, detail.Attempts)
+	}
+	attempt := detail.Attempts[0]
+	if attempt.HedgeBranch != 1 || attempt.Stage != attemptStageQualityPeekError || attempt.AccountID == nil || *attempt.AccountID != creds[0].ID {
+		t.Fatalf("peekErr attempt mismatch: %#v", attempt)
+	}
+	if !strings.Contains(attempt.TransportError, "quality_peek_error:") || len(attempt.ErrorChain) == 0 {
+		t.Fatalf("peekErr details missing: %#v", attempt)
+	}
+}
+
+func TestHedgeShadowPeekErrorAndHTTPFailureAggregateIntoWinnerAudit(t *testing.T) {
+	ctx := context.Background()
+	service, _, audits, creds, key, _ := setupHedgeGatewayTest(
+		t,
+		[]hedgeTestAccountSpec{{name: "shadow-peek-idle-1"}, {name: "shadow-429-2"}, {name: "winner-3"}},
+		QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 3, MinOutputTokens: 8,
+			HoldTimeout: 500 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HedgeEnabled: true, HedgeDelay: 25 * time.Millisecond, HedgeMaxConcurrent: 3,
+		},
+		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
+			0: func(bctx context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				reader, writer := io.Pipe()
+				go func() {
+					_, _ = io.WriteString(writer, sse(`data: {"type":"response.created","response":{"id":"resp-idle","model":"grok-4.7"}}`))
+					select {
+					case <-time.After(110 * time.Millisecond):
+						_ = writer.CloseWithError(neterrorpkg.ErrUpstreamStreamIdleTimeout)
+					case <-bctx.Done():
+						_ = writer.Close()
+					}
+				}()
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+					UpstreamURL: "https://build.example/v1/responses", Body: reader,
+				}, nil
+			},
+			1: func(bctx context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				select {
+				case <-time.After(120 * time.Millisecond):
+					return &provider.Response{
+						StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: make(http.Header),
+						UpstreamURL: "https://build.example/v1/responses",
+						Body:        io.NopCloser(strings.NewReader(`{"error":{"message":"shadow rate limit"}}`)),
+					}, nil
+				case <-bctx.Done():
+					return nil, bctx.Err()
+				}
+			},
+			2: func(_ context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+					Body: io.NopCloser(strings.NewReader(goodPlaintextSSE("resp-win-3", "fast-win-3"))),
+				}, nil
+			},
+		},
+	)
+
+	res, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-hedge-shadow-peek-and-429", ClientKey: key, PublicModel: "grok-4.7", Streaming: true,
+		Body: []byte(`{"model":"grok-4.7","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(res.Body)
+	res.Finalize(Usage{Reported: true, OutputTokens: 40, ReasoningTokens: 20}, "resp-win-3", "")
+	_ = res.Body.Close()
+	service.WaitShadowQualityProbes()
+
+	logs, _, err := audits.List(ctx, 0, 10)
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected 1 winner audit, err=%v logs=%#v", err, logs)
+	}
+	detail, err := audits.Get(ctx, logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.AttemptCount != 2 || len(detail.Attempts) != 2 {
+		t.Fatalf("expected 2 shadow attempts aggregated (peekErr + 429), got count=%d attempts=%#v", detail.AttemptCount, detail.Attempts)
+	}
+	var gotPeekErr, gotHTTP429 bool
+	for _, attempt := range detail.Attempts {
+		if attempt.HedgeBranch == 1 && attempt.Stage == attemptStageHedgeShadowPeekErr && attempt.AccountID != nil && *attempt.AccountID == creds[0].ID && strings.Contains(attempt.TransportError, neterrorpkg.ErrUpstreamStreamIdleTimeout.Error()) {
+			gotPeekErr = true
+		}
+		if attempt.HedgeBranch == 2 && attempt.Stage == "hedge_shadow:upstream_response" && attempt.AccountID != nil && *attempt.AccountID == creds[1].ID && attempt.UpstreamStatusCode != nil && *attempt.UpstreamStatusCode == http.StatusTooManyRequests {
+			gotHTTP429 = true
+		}
+	}
+	if !gotPeekErr || !gotHTTP429 {
+		t.Fatalf("missing expected shadow attempts: gotPeekErr=%t gotHTTP429=%t attempts=%#v", gotPeekErr, gotHTTP429, detail.Attempts)
+	}
 }

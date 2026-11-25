@@ -317,21 +317,25 @@ function UpstreamAttemptsPanel({
   }
 
   const terminalAttemptNumber = Math.max(...attempts.map((attempt) => attempt.number));
+  const auditFailed = Boolean(audit.errorCode) || audit.statusCode >= 400;
 
   return (
-    <div className="grid h-full min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] lg:grid-cols-[190px_minmax(0,1fr)] lg:grid-rows-1">
+    <div className="grid h-full min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] lg:grid-cols-[230px_minmax(0,1fr)] lg:grid-rows-1">
       <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-b border-border/40 bg-muted/25 px-4 py-2 sm:px-5 lg:border-r lg:border-b-0 lg:pr-2.5">
         <p className="mb-0.5 shrink-0 text-xs text-muted-foreground">{t("audits.attemptTimeline")}</p>
         <div className="flex max-h-28 gap-1 overflow-auto lg:min-h-0 lg:max-h-none lg:flex-1 lg:flex-col">
-          {attempts.map((attempt) => (
-            <AttemptButton
-              key={attempt.id}
-              attempt={attempt}
-              statusCode={attempt.upstreamStatusCode || (attempt.number === terminalAttemptNumber ? audit.statusCode : 0)}
-              selected={attempt.number === selectedAttempt.number}
-              onClick={() => setSelectedNumber(attempt.number)}
-            />
-          ))}
+          {attempts.map((attempt) => {
+            const fallbackStatus = attempt.number === terminalAttemptNumber && !isShadowStage(attempt.stage) && auditFailed ? audit.statusCode : 0;
+            return (
+              <AttemptButton
+                key={attempt.id}
+                attempt={attempt}
+                statusCode={attempt.upstreamStatusCode || fallbackStatus}
+                selected={attempt.number === selectedAttempt.number}
+                onClick={() => setSelectedNumber(attempt.number)}
+              />
+            );
+          })}
         </div>
       </aside>
       <AttemptDetail key={selectedAttempt.id} attempt={selectedAttempt} />
@@ -339,28 +343,139 @@ function UpstreamAttemptsPanel({
   );
 }
 
+type AttemptKind =
+  | "hedge_shadow_healthy"
+  | "hedge_shadow_degraded"
+  | "hedge_shadow_peek_error"
+  | "hedge_shadow_canceled"
+  | "hedge_shadow_failure"
+  | "quality_peek_error"
+  | "quality_hold"
+  | "response_stream"
+  | "upstream_http"
+  | "gateway_transport"
+  | "credential";
+
+function isShadowStage(stage: string): boolean {
+  return stage.startsWith("hedge_shadow");
+}
+
+function isQualityDiagnosticStage(stage: string): boolean {
+  return (
+    stage === "quality_hold" ||
+    stage === "quality_peek_error" ||
+    stage === "hedge_shadow_healthy" ||
+    stage === "hedge_shadow_degraded" ||
+    stage === "hedge_shadow_peek_error" ||
+    stage === "hedge_shadow_canceled"
+  );
+}
+
+function classifyAttempt(attempt: AuditAttemptDTO): AttemptKind {
+  switch (attempt.stage) {
+    case "hedge_shadow_healthy":
+      return "hedge_shadow_healthy";
+    case "hedge_shadow_degraded":
+      return "hedge_shadow_degraded";
+    case "hedge_shadow_peek_error":
+      return "hedge_shadow_peek_error";
+    case "hedge_shadow_canceled":
+      return "hedge_shadow_canceled";
+    case "quality_peek_error":
+      return "quality_peek_error";
+    case "quality_hold":
+      return "quality_hold";
+  }
+  if (attempt.stage.startsWith("hedge_shadow")) {
+    return "hedge_shadow_failure";
+  }
+  if (attempt.source === "upstream_http" && attempt.stage === "response_stream") {
+    return "response_stream";
+  }
+  if (attempt.source === "upstream_http") {
+    return "upstream_http";
+  }
+  if (attempt.source === "gateway_transport") {
+    return "gateway_transport";
+  }
+  return "credential";
+}
+
+function attemptStageTagKey(kind: AttemptKind): string | null {
+  switch (kind) {
+    case "hedge_shadow_healthy":
+      return "audits.stageTagShadowHealthy";
+    case "hedge_shadow_degraded":
+      return "audits.stageTagShadowDegraded";
+    case "hedge_shadow_peek_error":
+      return "audits.stageTagShadowPeekError";
+    case "hedge_shadow_canceled":
+      return "audits.stageTagShadowCanceled";
+    case "hedge_shadow_failure":
+      return "audits.stageTagShadowFailure";
+    case "quality_peek_error":
+      return "audits.stageTagQualityPeekError";
+    case "quality_hold":
+      return "audits.stageTagQualityHold";
+    default:
+      return null;
+  }
+}
+
+function attemptBadgeFailed(kind: AttemptKind): boolean {
+  return (
+    kind === "response_stream" ||
+    kind === "quality_hold" ||
+    kind === "quality_peek_error" ||
+    kind === "hedge_shadow_degraded" ||
+    kind === "hedge_shadow_peek_error" ||
+    kind === "hedge_shadow_canceled"
+  );
+}
+
 function AttemptButton({ attempt, statusCode, selected, onClick }: { attempt: AuditAttemptDTO; statusCode: number; selected: boolean; onClick: () => void }) {
   const { t } = useTranslation();
-  const Icon = attempt.source === "upstream_http" ? Server : attempt.source === "gateway_transport" ? Network : KeyRound;
+  const kind = classifyAttempt(attempt);
+  const stageTagKey = attemptStageTagKey(kind);
+  const branchLabel = attempt.hedgeBranch && attempt.hedgeBranch > 0 ? t("audits.hedgeBranchTag", { branch: attempt.hedgeBranch }) : null;
+  const hasMetaLine = Boolean(branchLabel || stageTagKey);
+  const Icon = kind === "hedge_shadow_healthy" ? CheckCircle2 : attempt.source === "upstream_http" ? Server : attempt.source === "gateway_transport" ? Network : KeyRound;
+  const iconClass = kind === "hedge_shadow_healthy" ? "size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" : "size-3.5 shrink-0";
+  const tagClass =
+    kind === "hedge_shadow_healthy"
+      ? "text-emerald-700 dark:text-emerald-300"
+      : kind === "hedge_shadow_degraded" || kind === "hedge_shadow_peek_error" || kind === "quality_peek_error" || kind === "quality_hold"
+      ? "text-amber-700 dark:text-amber-300"
+      : "text-muted-foreground";
   return (
     <button
       type="button"
       className={cn(
-        "flex h-8 w-36 shrink-0 items-center justify-between gap-2 rounded-lg px-2.5 text-left text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 lg:w-full",
+        "flex w-44 shrink-0 flex-col justify-center gap-0.5 rounded-lg px-2.5 text-left text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 lg:w-full",
+        hasMetaLine ? "py-1.5" : "h-8",
         selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/60"
       )}
       aria-pressed={selected}
       onClick={onClick}
     >
-      <span className="flex min-w-0 items-center gap-2 truncate">
-        <Icon className="size-3.5 shrink-0" />
-        {t("audits.attemptNumber", { number: attempt.number })}
-      </span>
-      {statusCode ? (
-        <StatusBadge statusCode={statusCode} failed={attempt.stage === "response_stream" || attempt.stage === "quality_hold"} />
-      ) : (
-        <span className="shrink-0 text-xs text-muted-foreground">—</span>
-      )}
+      <div className="flex w-full min-w-0 items-center justify-between gap-2">
+        <span className="flex min-w-0 items-center gap-2 truncate">
+          <Icon className={iconClass} />
+          <span className="truncate">{t("audits.attemptNumber", { number: attempt.number })}</span>
+        </span>
+        {statusCode ? (
+          <StatusBadge statusCode={statusCode} failed={attemptBadgeFailed(kind)} />
+        ) : (
+          <span className="shrink-0 text-xs text-muted-foreground">—</span>
+        )}
+      </div>
+      {hasMetaLine ? (
+        <div className="flex min-w-0 items-center gap-1 pl-5.5 text-[10px] leading-tight text-muted-foreground">
+          {branchLabel ? <span className="shrink-0 font-medium text-foreground/80">{branchLabel}</span> : null}
+          {branchLabel && stageTagKey ? <span aria-hidden="true">·</span> : null}
+          {stageTagKey ? <span className={cn("truncate", tagClass)}>{t(stageTagKey)}</span> : null}
+        </div>
+      ) : null}
     </button>
   );
 }
@@ -370,6 +485,7 @@ function AttemptDetail({ attempt }: { attempt: AuditAttemptDTO }) {
   const hasBody = Boolean(attempt.responseBody);
   const hasHeaders = Object.keys(attempt.responseHeaders).length > 0;
   const hasErrors = attempt.errorChain.length > 0;
+  const bodyTabLabel = isQualityDiagnosticStage(attempt.stage) ? t("audits.diagnosticSnapshot") : t("audits.responseBody");
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <Tabs defaultValue="overview" className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-4 sm:px-5">
@@ -378,7 +494,7 @@ function AttemptDetail({ attempt }: { attempt: AuditAttemptDTO }) {
           <div className="ml-auto max-w-full shrink-0 overflow-x-auto pb-0.5">
             <TabsList className="h-7 w-max">
               <TabsTrigger value="overview" className="h-6 px-2.5 text-xs">{t("audits.overview")}</TabsTrigger>
-              {hasBody ? <TabsTrigger value="body" className="h-6 px-2.5 text-xs">{t("audits.responseBody")}</TabsTrigger> : null}
+              {hasBody ? <TabsTrigger value="body" className="h-6 px-2.5 text-xs">{bodyTabLabel}</TabsTrigger> : null}
               {hasHeaders ? <TabsTrigger value="headers" className="h-6 px-2.5 text-xs">{t("audits.responseHeaders")}</TabsTrigger> : null}
               {hasErrors ? <TabsTrigger value="errors" className="h-6 px-2.5 text-xs">{t("audits.errorChain")}</TabsTrigger> : null}
             </TabsList>
@@ -417,31 +533,89 @@ function AttemptResponseBody({ attempt }: { attempt: AuditAttemptDTO }) {
 
 function AttemptSummary({ attempt }: { attempt: AuditAttemptDTO }) {
   const { t } = useTranslation();
-  const isHTTP = attempt.source === "upstream_http";
-  const isStreamFailure = isHTTP && attempt.stage === "response_stream";
-  const Icon = isHTTP ? Server : attempt.source === "gateway_transport" ? Network : KeyRound;
-  const title = isStreamFailure
-    ? t("audits.upstreamStreamFailure", { status: attempt.upstreamStatusCode ?? "-" })
-    : isHTTP
-    ? t("audits.upstreamHttpFailure", { status: attempt.upstreamStatusCode ?? "-" })
-    : attempt.source === "gateway_transport"
-    ? t("audits.gatewayTransportFailure")
-    : t("audits.credentialFailure");
+  const kind = classifyAttempt(attempt);
+  const status = attempt.upstreamStatusCode ?? "-";
+  let Icon = attempt.source === "upstream_http" ? Server : attempt.source === "gateway_transport" ? Network : KeyRound;
+  let iconClass = "size-4 shrink-0 text-destructive";
+  let title: string;
+  switch (kind) {
+    case "hedge_shadow_healthy":
+      Icon = CheckCircle2;
+      iconClass = "size-4 shrink-0 text-emerald-600 dark:text-emerald-400";
+      title = t("audits.hedgeShadowHealthyTitle", { status });
+      break;
+    case "hedge_shadow_degraded":
+      Icon = TriangleAlert;
+      iconClass = "size-4 shrink-0 text-amber-600 dark:text-amber-400";
+      title = t("audits.hedgeShadowDegradedTitle", { status });
+      break;
+    case "hedge_shadow_peek_error":
+      Icon = TriangleAlert;
+      iconClass = "size-4 shrink-0 text-amber-600 dark:text-amber-400";
+      title = t("audits.hedgeShadowPeekErrorTitle", { status });
+      break;
+    case "hedge_shadow_canceled":
+      Icon = TriangleAlert;
+      iconClass = "size-4 shrink-0 text-muted-foreground";
+      title = t("audits.hedgeShadowCanceledTitle");
+      break;
+    case "hedge_shadow_failure":
+      title = attempt.source === "upstream_http"
+        ? t("audits.hedgeShadowHttpFailureTitle", { status })
+        : attempt.source === "gateway_transport"
+        ? t("audits.hedgeShadowTransportFailureTitle")
+        : t("audits.hedgeShadowCredentialFailureTitle");
+      break;
+    case "quality_peek_error":
+      Icon = TriangleAlert;
+      iconClass = "size-4 shrink-0 text-amber-600 dark:text-amber-400";
+      title = t("audits.qualityPeekErrorTitle", { status });
+      break;
+    case "quality_hold":
+      Icon = TriangleAlert;
+      iconClass = "size-4 shrink-0 text-amber-600 dark:text-amber-400";
+      title = t("audits.qualityHoldTitle", { status });
+      break;
+    case "response_stream":
+      title = t("audits.upstreamStreamFailure", { status });
+      break;
+    case "upstream_http":
+      title = t("audits.upstreamHttpFailure", { status });
+      break;
+    case "gateway_transport":
+      title = t("audits.gatewayTransportFailure");
+      break;
+    default:
+      title = t("audits.credentialFailure");
+      break;
+  }
   return (
     <div className="flex min-w-0 items-center gap-2">
-      <Icon className="size-4 shrink-0 text-destructive" />
+      <Icon className={iconClass} />
       <p className="min-w-0 truncate font-medium">{title}</p>
+      {attempt.hedgeBranch && attempt.hedgeBranch > 0 ? (
+        <Badge variant="outline" className="h-5 shrink-0 px-1.5 text-[11px] font-normal">
+          {t("audits.hedgeBranchTag", { branch: attempt.hedgeBranch })}
+        </Badge>
+      ) : null}
     </div>
   );
 }
 
 function AttemptOverview({ attempt }: { attempt: AuditAttemptDTO }) {
   const { t, i18n } = useTranslation();
+  const kind = classifyAttempt(attempt);
+  const stageTagKey = attemptStageTagKey(kind);
+  const stageValue = stageTagKey ? `${t(stageTagKey)} (${attempt.stage})` : attempt.stage;
   return (
     <div className="grid gap-x-10 gap-y-4 px-1 py-3 sm:grid-cols-2">
       <OverviewField label={t("audits.attemptStartedAt")} value={formatDateTime(attempt.startedAt, i18n.language)} />
       <OverviewField label={t("audits.duration")} value={`${formatNumber(attempt.durationMs, i18n.language)} ms`} />
       <OverviewField label={t("audits.targetAccount")} value={attempt.accountName || (attempt.accountId ? `#${attempt.accountId}` : "-")} />
+      {attempt.hedgeBranch && attempt.hedgeBranch > 0 ? (
+        <OverviewField label={t("audits.hedgeBranch")} value={`#${attempt.hedgeBranch}`} />
+      ) : null}
+      <OverviewField label={t("audits.attemptStage")} value={stageValue} />
       <OverviewField label={t("audits.requestMethod")} value={attempt.method || "-"} />
       <OverviewField label={t("audits.requestPath")} value={attempt.requestPath || "-"} />
       <OverviewField label={t("audits.upstreamStatus")} value={attempt.upstreamStatus || (attempt.upstreamStatusCode ? String(attempt.upstreamStatusCode) : "-")} />
@@ -576,7 +750,7 @@ function EmptyPanel({ icon, message }: { icon: ReactNode; message: string }) {
 function formattedResponseBody(attempt: AuditAttemptDTO): string {
   if (attempt.responseBodyEncoding !== "utf8") return attempt.responseBody;
   const contentType = Object.entries(attempt.responseHeaders).find(([name]) => name.toLowerCase() === "content-type")?.[1].join(";") ?? "";
-  if (attempt.stage !== "response_stream" && !contentType.toLowerCase().includes("json")) return attempt.responseBody;
+  if (attempt.stage !== "response_stream" && !isQualityDiagnosticStage(attempt.stage) && !contentType.toLowerCase().includes("json")) return attempt.responseBody;
   return formatJSONBody(attempt.responseBody);
 }
 

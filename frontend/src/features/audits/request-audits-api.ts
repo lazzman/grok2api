@@ -76,6 +76,7 @@ export type AuditDTO = {
 export type AuditAttemptDTO = {
   id: string;
   number: number;
+  hedgeBranch?: number;
   source: "upstream_http" | "gateway_transport" | "credential";
   stage: string;
   accountId?: string;
@@ -161,7 +162,7 @@ const auditValidator = hasShape({
   requestHeaders: isOptional(isRecordOf(isArrayOf(isString))), attemptCount: isNumber, createdAt: isString,
 });
 const auditAttemptValidator = hasShape({
-  id: isString, number: isNumber, source: isOneOf("upstream_http", "gateway_transport", "credential"), stage: isString,
+  id: isString, number: isNumber, hedgeBranch: isOptional(isNumber), source: isOneOf("upstream_http", "gateway_transport", "credential"), stage: isString,
   accountId: isOptional(isString), accountName: isOptional(isString), method: isOptional(isString), requestPath: isOptional(isString), upstreamUrl: isOptional(isString),
   startedAt: isString, durationMs: isNumber, upstreamStatusCode: isOptional(isNumber), upstreamStatus: isOptional(isString),
   responseHeaders: isRecordOf(isArrayOf(isString)), responseBody: isString, responseBodyEncoding: isOneOf("utf8", "base64"), responseBodyTruncated: isBoolean,

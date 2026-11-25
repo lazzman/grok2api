@@ -11,6 +11,7 @@ import (
 type AuditRepository interface {
 	Create(ctx context.Context, value audit.Record) error
 	CreateBatch(ctx context.Context, values []audit.Record) error
+	AppendAttemptsByEventID(ctx context.Context, eventID string, attempts []audit.Attempt) error
 	Get(ctx context.Context, id uint64) (audit.Record, error)
 	List(ctx context.Context, offset, limit int) ([]audit.Record, int64, error)
 	ListCursor(ctx context.Context, query AuditCursorQuery) ([]audit.Record, bool, error)

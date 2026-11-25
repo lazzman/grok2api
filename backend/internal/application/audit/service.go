@@ -478,6 +478,14 @@ func (s *Service) Get(ctx context.Context, id uint64) (auditdomain.Record, error
 	return s.audits.Get(ctx, id)
 }
 
+// AppendAttemptsByEventID 向已落库的主请求审计追加诊断尝试（如阶梯并发后台影子质检结果）。
+func (s *Service) AppendAttemptsByEventID(ctx context.Context, eventID string, attempts []auditdomain.Attempt) error {
+	if len(attempts) == 0 {
+		return nil
+	}
+	return s.audits.AppendAttemptsByEventID(ctx, eventID, attempts)
+}
+
 // PurgeOutdated 清理超过指定保留天数的历史审计记录。
 func (s *Service) PurgeOutdated(ctx context.Context, retentionDays int) (int64, error) {
 	if retentionDays <= 0 {

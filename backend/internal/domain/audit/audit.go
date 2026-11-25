@@ -41,9 +41,11 @@ type ErrorFrame struct {
 
 // Attempt 保存一次失败尝试经过裁剪和脱敏的管理员诊断快照。
 type Attempt struct {
-	ID                    uint64
-	AuditID               uint64
-	Number                int
+	ID      uint64
+	AuditID uint64
+	Number  int
+	// >0 表示阶梯并发的第 N 路分支；0 表示串行尝试。
+	HedgeBranch           int
 	Source                AttemptSource
 	Stage                 string
 	AccountID             *uint64

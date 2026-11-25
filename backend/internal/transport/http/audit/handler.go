@@ -154,6 +154,7 @@ type billingComponentResponse struct {
 type auditAttemptResponse struct {
 	ID                    uint64                    `json:"id,string"`
 	Number                int                       `json:"number"`
+	HedgeBranch           int                       `json:"hedgeBranch,omitempty"`
 	Source                string                    `json:"source"`
 	Stage                 string                    `json:"stage"`
 	AccountID             *uint64                   `json:"accountId,string,omitempty"`
@@ -258,7 +259,7 @@ func (h *Handler) get(c *gin.Context) {
 			errorChain = append(errorChain, auditErrorFrameResponse{Type: frame.Type, Message: frame.Message})
 		}
 		attempts = append(attempts, auditAttemptResponse{
-			ID: attempt.ID, Number: attempt.Number, Source: string(attempt.Source), Stage: attempt.Stage,
+			ID: attempt.ID, Number: attempt.Number, HedgeBranch: attempt.HedgeBranch, Source: string(attempt.Source), Stage: attempt.Stage,
 			AccountID: attempt.AccountID, AccountName: attempt.AccountName, Method: attempt.Method, RequestPath: attempt.RequestPath,
 			UpstreamURL: attempt.UpstreamURL, StartedAt: attempt.StartedAt, DurationMS: attempt.DurationMS,
 			UpstreamStatusCode: attempt.UpstreamStatusCode, UpstreamStatus: attempt.UpstreamStatus,

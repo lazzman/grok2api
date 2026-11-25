@@ -154,6 +154,9 @@ func validatePreparedAuditAttempt(value requestAuditAttemptModel) error {
 	if value.Number <= 0 {
 		return errors.New("number must be positive")
 	}
+	if value.HedgeBranch < 0 {
+		return errors.New("hedge_branch must be non-negative")
+	}
 	if !auditStringAllowed(value.Source, "upstream_http", "gateway_transport", "credential") {
 		return errors.New("source is invalid")
 	}
@@ -389,41 +392,101 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 	}
 	attempts := make([]requestAuditAttemptModel, 0, len(value.Attempts))
 	for _, attempt := range value.Attempts {
-		responseHeaders, err := json.Marshal(attempt.ResponseHeaders)
+		model, err := toAuditAttemptModel(attempt)
 		if err != nil {
-			return requestAuditModel{}, nil, fmt.Errorf("序列化审计响应头: %w", err)
+			return requestAuditModel{}, nil, err
 		}
-		if attempt.ResponseHeaders == nil {
-			responseHeaders = []byte("{}")
-		}
-		errorChain, err := json.Marshal(attempt.ErrorChain)
-		if err != nil {
-			return requestAuditModel{}, nil, fmt.Errorf("序列化审计错误链: %w", err)
-		}
-		if attempt.ErrorChain == nil {
-			errorChain = []byte("[]")
-		}
-		attempts = append(attempts, requestAuditAttemptModel{
-			Number:                attempt.Number,
-			Source:                string(attempt.Source),
-			Stage:                 attempt.Stage,
-			AccountID:             attempt.AccountID,
-			AccountName:           truncate(attempt.AccountName, 160),
-			Method:                truncate(attempt.Method, 16),
-			RequestPath:           truncate(attempt.RequestPath, 2048),
-			UpstreamURL:           truncate(attempt.UpstreamURL, 4096),
-			StartedAt:             attempt.StartedAt,
-			DurationMS:            nonNegative(attempt.DurationMS),
-			UpstreamStatusCode:    attempt.UpstreamStatusCode,
-			UpstreamStatus:        truncate(attempt.UpstreamStatus, 128),
-			ResponseHeadersJSON:   string(responseHeaders),
-			ResponseBody:          truncateBytes(attempt.ResponseBody, 65536),
-			ResponseBodyTruncated: attempt.ResponseBodyTruncated || len(attempt.ResponseBody) > 65536,
-			TransportError:        truncate(attempt.TransportError, 2048),
-			ErrorChainJSON:        string(errorChain),
-		})
+		attempts = append(attempts, model)
 	}
 	return row, attempts, nil
+}
+
+func toAuditAttemptModel(attempt audit.Attempt) (requestAuditAttemptModel, error) {
+	responseHeaders, err := json.Marshal(attempt.ResponseHeaders)
+	if err != nil {
+		return requestAuditAttemptModel{}, fmt.Errorf("序列化审计响应头: %w", err)
+	}
+	if attempt.ResponseHeaders == nil {
+		responseHeaders = []byte("{}")
+	}
+	errorChain, err := json.Marshal(attempt.ErrorChain)
+	if err != nil {
+		return requestAuditAttemptModel{}, fmt.Errorf("序列化审计错误链: %w", err)
+	}
+	if attempt.ErrorChain == nil {
+		errorChain = []byte("[]")
+	}
+	return requestAuditAttemptModel{
+		Number:                attempt.Number,
+		HedgeBranch:           attempt.HedgeBranch,
+		Source:                string(attempt.Source),
+		Stage:                 attempt.Stage,
+		AccountID:             attempt.AccountID,
+		AccountName:           truncate(attempt.AccountName, 160),
+		Method:                truncate(attempt.Method, 16),
+		RequestPath:           truncate(attempt.RequestPath, 2048),
+		UpstreamURL:           truncate(attempt.UpstreamURL, 4096),
+		StartedAt:             attempt.StartedAt,
+		DurationMS:            nonNegative(attempt.DurationMS),
+		UpstreamStatusCode:    attempt.UpstreamStatusCode,
+		UpstreamStatus:        truncate(attempt.UpstreamStatus, 128),
+		ResponseHeadersJSON:   string(responseHeaders),
+		ResponseBody:          truncateBytes(attempt.ResponseBody, 65536),
+		ResponseBodyTruncated: attempt.ResponseBodyTruncated || len(attempt.ResponseBody) > 65536,
+		TransportError:        truncate(attempt.TransportError, 2048),
+		ErrorChainJSON:        string(errorChain),
+	}, nil
+}
+
+// AppendAttemptsByEventID 按主请求的 event_id 原子追加上游诊断尝试，并同步递增 attempt_count。
+func (r *AuditRepository) AppendAttemptsByEventID(ctx context.Context, eventID string, attempts []audit.Attempt) error {
+	if len(attempts) == 0 {
+		return nil
+	}
+	eventID = strings.TrimSpace(eventID)
+	if length := utf8.RuneCountInString(eventID); length < 16 || length > 64 {
+		return errors.New("event_id length must be between 16 and 64")
+	}
+	prepared := make([]requestAuditAttemptModel, 0, len(attempts))
+	for _, attempt := range attempts {
+		model, err := toAuditAttemptModel(attempt)
+		if err != nil {
+			return err
+		}
+		prepared = append(prepared, model)
+	}
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := tx.Where("event_id = ?", eventID)
+		if r.db.dialect == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		var row requestAuditModel
+		if err := query.First(&row).Error; err != nil {
+			return mapError(err)
+		}
+		var maxNumber int
+		if err := tx.Model(&requestAuditAttemptModel{}).
+			Where("audit_id = ?", row.ID).
+			Select("COALESCE(MAX(number), 0)").
+			Scan(&maxNumber).Error; err != nil {
+			return err
+		}
+		models := make([]requestAuditAttemptModel, len(prepared))
+		for index, model := range prepared {
+			model.AuditID = row.ID
+			model.Number = maxNumber + index + 1
+			if err := validatePreparedAuditAttempt(model); err != nil {
+				return fmt.Errorf("attempt %d: %w", index+1, err)
+			}
+			models[index] = model
+		}
+		if err := insertAuditAttempts(tx, row.ID, models); err != nil {
+			return err
+		}
+		return tx.Model(&requestAuditModel{}).
+			Where("id = ?", row.ID).
+			Update("attempt_count", gorm.Expr("attempt_count + ?", len(models))).Error
+	})
 }
 
 func truncateBytes(value []byte, limit int) []byte {

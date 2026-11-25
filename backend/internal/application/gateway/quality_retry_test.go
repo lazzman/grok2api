@@ -2001,7 +2001,6 @@ func TestNormalizeQualityRetryDefaults(t *testing.T) {
 	}
 }
 
-
 func setupQualityHoldLoopTest(t *testing.T, names []string, responses map[int][]scriptedBuildResponse, cfg QualityRetryRuntime) (*Service, *relational.AccountRepository, []accountdomain.Credential, clientkey.Key, *scriptedBuildAdapter) {
 	t.Helper()
 	ctx := context.Background()
@@ -2299,7 +2298,6 @@ func TestAttemptLoopQualityDegradedPersistsDiagnosticAndLogsReason(t *testing.T)
 	}
 }
 
-
 func TestPeekQualityStreamPureClientToolCallAndServerToolIsolation(t *testing.T) {
 	t.Parallel()
 	// 纯客户端工具调用（即使携带高额 usage.output_tokens 和密文且无思考明文）应放行。
@@ -2359,5 +2357,60 @@ func TestPeekQualityStreamPureClientToolCallAndServerToolIsolation(t *testing.T)
 	_ = replay3.Close()
 	if verdict3 != QualityDeliver || diag3.Reason != QualityWithholdNone {
 		t.Fatalf("short reply without heavy reasoning bill should deliver, got verdict=%s diag=%#v", verdict3, diag3)
+	}
+}
+
+func TestSerialQualityPeekErrorAggregatesIntoWinnerAudit(t *testing.T) {
+	ctx := context.Background()
+	service, _, audits, creds, key, _ := setupHedgeGatewayTest(
+		t,
+		[]hedgeTestAccountSpec{{name: "serial-empty-1"}, {name: "serial-ok-2"}},
+		QualityRetryRuntime{
+			Enabled: true, MaxAttempts: 2, MinOutputTokens: 8,
+			HoldTimeout: 500 * time.Millisecond, OnExhausted: qualityRetryFailClosed,
+			HedgeEnabled: false,
+		},
+		map[int]func(context.Context, provider.ResponseResourceRequest) (*provider.Response, error){
+			0: func(_ context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+					UpstreamURL: "https://build.example/v1/responses",
+					Body:        io.NopCloser(strings.NewReader("")),
+				}, nil
+			},
+			1: func(_ context.Context, _ provider.ResponseResourceRequest) (*provider.Response, error) {
+				return &provider.Response{
+					StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+					Body: io.NopCloser(strings.NewReader(goodPlaintextSSE("resp-serial-2", "ok"))),
+				}, nil
+			},
+		},
+	)
+
+	res, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-serial-peek-err", ClientKey: key, PublicModel: "grok-4.7", Streaming: true,
+		Body: []byte(`{"model":"grok-4.7","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(res.Body)
+	res.Finalize(Usage{Reported: true, OutputTokens: 40, ReasoningTokens: 20}, "resp-serial-2", "")
+	_ = res.Body.Close()
+
+	logs, _, err := audits.List(ctx, 0, 10)
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected 1 winner audit, err=%v logs=%#v", err, logs)
+	}
+	detail, err := audits.Get(ctx, logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.AttemptCount != 1 || len(detail.Attempts) != 1 {
+		t.Fatalf("expected 1 serial peekErr attempt, got count=%d attempts=%#v", detail.AttemptCount, detail.Attempts)
+	}
+	attempt := detail.Attempts[0]
+	if attempt.HedgeBranch != 0 || attempt.Stage != attemptStageQualityPeekError || attempt.AccountID == nil || *attempt.AccountID != creds[0].ID {
+		t.Fatalf("serial peekErr attempt mismatch: %#v", attempt)
 	}
 }

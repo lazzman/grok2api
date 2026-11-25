@@ -360,6 +360,7 @@ type requestAuditAttemptModel struct {
 	ID                    uint64             `gorm:"primaryKey;autoIncrement"`
 	AuditID               uint64             `gorm:"not null;uniqueIndex:uidx_audit_attempt_number;check:chk_request_audit_attempts_audit_id,audit_id > 0"`
 	Number                int                `gorm:"not null;uniqueIndex:uidx_audit_attempt_number;check:chk_request_audit_attempts_number,number > 0"`
+	HedgeBranch           int                `gorm:"not null;default:0"`
 	Source                string             `gorm:"size:32;not null;check:chk_request_audit_attempts_source,source IN ('upstream_http','gateway_transport','credential')"`
 	Stage                 string             `gorm:"size:64;not null;check:chk_request_audit_attempts_stage,length(trim(stage)) BETWEEN 1 AND 64"`
 	AccountID             *uint64            `gorm:"check:chk_request_audit_attempts_account_id,account_id IS NULL OR account_id > 0"`

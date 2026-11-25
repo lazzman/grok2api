@@ -304,6 +304,7 @@ func toAuditAttemptDomain(value requestAuditAttemptModel) (audit.Attempt, error)
 		ID:                    value.ID,
 		AuditID:               value.AuditID,
 		Number:                value.Number,
+		HedgeBranch:           value.HedgeBranch,
 		Source:                audit.AttemptSource(value.Source),
 		Stage:                 value.Stage,
 		AccountID:             value.AccountID,

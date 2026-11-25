@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -23,15 +24,43 @@ import (
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
+const (
+	attemptStageQualityHold         = "quality_hold"
+	attemptStageQualityPeekError    = "quality_peek_error"
+	attemptStageHedgeShadowPrefix   = "hedge_shadow:"
+	attemptStageHedgeShadowHealthy  = "hedge_shadow_healthy"
+	attemptStageHedgeShadowDegraded = "hedge_shadow_degraded"
+	attemptStageHedgeShadowPeekErr  = "hedge_shadow_peek_error"
+	attemptStageHedgeShadowCanceled = "hedge_shadow_canceled"
+	attemptStageHedgeShadowFailed   = "hedge_shadow_failed"
+	attemptStageMaxLen              = 64
+)
+
 type failureAttemptRecorder struct {
+	mu                  sync.Mutex
 	method              string
 	path                string
+	hedgeBranch         int
 	remainingBodyBudget int
 	attempts            []audit.Attempt
+	sealed              bool
+	commitDone          chan struct{}
+	commitDoneOnce      sync.Once
+	commitOK            bool
 }
 
 func newFailureAttemptRecorder(method, path string) *failureAttemptRecorder {
-	return &failureAttemptRecorder{method: method, path: sanitizeRequestPath(path), remainingBodyBudget: diagnosticTotalBodyLimit}
+	return newHedgeFailureAttemptRecorder(method, path, 0)
+}
+
+func newHedgeFailureAttemptRecorder(method, path string, hedgeBranch int) *failureAttemptRecorder {
+	return &failureAttemptRecorder{
+		method:              method,
+		path:                sanitizeRequestPath(path),
+		hedgeBranch:         max(0, hedgeBranch),
+		remainingBodyBudget: diagnosticTotalBodyLimit,
+		commitDone:          make(chan struct{}),
+	}
 }
 
 const (
@@ -153,12 +182,17 @@ func (r *failureAttemptRecorder) captureResponse(credential accountdomain.Creden
 }
 
 func (r *failureAttemptRecorder) captureStreamFailure(credential accountdomain.Credential, startedAt time.Time, response *provider.Response, diagnostic StreamFailureDiagnostic) {
+	r.captureStreamFailureForBranch(0, credential, startedAt, response, diagnostic)
+}
+
+func (r *failureAttemptRecorder) captureStreamFailureForBranch(branchID int, credential accountdomain.Credential, startedAt time.Time, response *provider.Response, diagnostic StreamFailureDiagnostic) {
 	if response == nil {
 		return
 	}
 	statusCode := response.StatusCode
 	body, bodyTruncated := r.captureBody(diagnostic.Body, diagnostic.BodyTruncated)
 	r.append(audit.Attempt{
+		HedgeBranch:           max(0, branchID),
 		Source:                audit.AttemptSourceUpstreamHTTP,
 		Stage:                 "response_stream",
 		AccountID:             auditAccountID(credential.ID),
@@ -277,6 +311,12 @@ func (r *failureAttemptRecorder) captureSelectionFailure(accountID uint64, accou
 }
 
 func (r *failureAttemptRecorder) hasStreamFailureFor(accountID uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.hasStreamFailureForLocked(accountID)
+}
+
+func (r *failureAttemptRecorder) hasStreamFailureForLocked(accountID uint64) bool {
 	for _, attempt := range r.attempts {
 		if attempt.Stage != "response_stream" || attempt.AccountID == nil || *attempt.AccountID != accountID {
 			continue
@@ -289,11 +329,16 @@ func (r *failureAttemptRecorder) hasStreamFailureFor(accountID uint64) bool {
 // ensureStreamFailureAttempt 补记已完成 2xx 响应头握手、但随后失败的流式尝试。
 // 既有 4xx 或传输失败记录不能屏蔽该尝试；同一账号已有 response_stream 时不重复追加。
 func (r *failureAttemptRecorder) ensureStreamFailureAttempt(credential accountdomain.Credential, startedAt time.Time, response *provider.Response, errorCode string) {
-	if response == nil || response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices || r.hasStreamFailureFor(credential.ID) {
+	r.ensureStreamFailureAttemptForBranch(0, credential, startedAt, response, errorCode)
+}
+
+func (r *failureAttemptRecorder) ensureStreamFailureAttemptForBranch(branchID int, credential accountdomain.Credential, startedAt time.Time, response *provider.Response, errorCode string) {
+	if response == nil || response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return
 	}
 	statusCode := response.StatusCode
-	r.append(audit.Attempt{
+	attempt := audit.Attempt{
+		HedgeBranch:        max(0, branchID),
 		Source:             audit.AttemptSourceUpstreamHTTP,
 		Stage:              "response_stream",
 		AccountID:          auditAccountID(credential.ID),
@@ -307,39 +352,328 @@ func (r *failureAttemptRecorder) ensureStreamFailureAttempt(credential accountdo
 		UpstreamStatus:     response.Status,
 		ResponseHeaders:    sanitizeDiagnosticHeaders(response.Header),
 		TransportError:     errorCode,
-	})
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.hasStreamFailureForLocked(credential.ID) {
+		return
+	}
+	r.appendLocked(attempt)
 }
 
 func (r *failureAttemptRecorder) captureQualityDegraded(credential accountdomain.Credential, startedAt time.Time, upstreamURL string, diag QualityPeekDiagnostic) audit.Attempt {
+	return r.captureQualityDegradedForBranch(0, credential, startedAt, upstreamURL, diag)
+}
+
+func (r *failureAttemptRecorder) captureQualityDegradedForBranch(branchID int, credential accountdomain.Credential, startedAt time.Time, upstreamURL string, diag QualityPeekDiagnostic) audit.Attempt {
 	status := http.StatusOK
+	durationMS := time.Since(startedAt).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
 	attempt := audit.Attempt{
+		HedgeBranch:        max(0, branchID),
 		Source:             audit.AttemptSourceUpstreamHTTP,
-		Stage:              "quality_hold",
+		Stage:              attemptStageQualityHold,
 		AccountID:          auditAccountID(credential.ID),
 		AccountName:        credential.Name,
 		Method:             r.method,
 		RequestPath:        r.path,
 		UpstreamURL:        sanitizeUpstreamURL(upstreamURL),
 		StartedAt:          startedAt.UTC(),
-		DurationMS:         time.Since(startedAt).Milliseconds(),
+		DurationMS:         durationMS,
 		UpstreamStatusCode: &status,
 		UpstreamStatus:     "200 OK",
 		ResponseBody:       marshalQualityDiagnostic(diag),
 		TransportError:     qualityDiagnosticTransportError(diag.Reason),
 	}
-	r.append(attempt)
+	return r.append(attempt)
+}
+
+// captureQualityPeekError 记录 2xx 响应头之后、质量闸门窥探阶段发生的流中断/空流/空闲超时。
+func (r *failureAttemptRecorder) captureQualityPeekError(credential accountdomain.Credential, startedAt time.Time, response *provider.Response, diag QualityPeekDiagnostic, peekErr error, branchID int) audit.Attempt {
+	if peekErr == nil {
+		return audit.Attempt{}
+	}
+	status := http.StatusOK
+	upstreamStatus := "200 OK"
+	upstreamURL := sanitizeUpstreamURL(errorUpstreamURL(peekErr))
+	var headers map[string][]string
+	if response != nil {
+		if response.StatusCode >= 100 && response.StatusCode <= 599 {
+			status = response.StatusCode
+		}
+		if response.Status != "" {
+			upstreamStatus = response.Status
+		}
+		if response.UpstreamURL != "" {
+			upstreamURL = sanitizeUpstreamURL(response.UpstreamURL)
+		}
+		headers = sanitizeDiagnosticHeaders(response.Header)
+	}
+	durationMS := time.Since(startedAt).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+	attempt := audit.Attempt{
+		HedgeBranch:        max(0, branchID),
+		Source:             audit.AttemptSourceUpstreamHTTP,
+		Stage:              attemptStageQualityPeekError,
+		AccountID:          auditAccountID(credential.ID),
+		AccountName:        credential.Name,
+		Method:             r.method,
+		RequestPath:        r.path,
+		UpstreamURL:        upstreamURL,
+		StartedAt:          startedAt.UTC(),
+		DurationMS:         durationMS,
+		UpstreamStatusCode: &status,
+		UpstreamStatus:     upstreamStatus,
+		ResponseHeaders:    headers,
+		ResponseBody:       marshalQualityDiagnostic(diag),
+		TransportError:     qualityPeekErrorTransportText(peekErr),
+		ErrorChain:         errorFrames(peekErr),
+	}
+	return r.append(attempt)
+}
+
+func qualityPeekErrorTransportText(err error) string {
+	if err == nil {
+		return attemptStageQualityPeekError
+	}
+	message := sanitizeDiagnosticText(err.Error(), diagnosticTextLimit)
+	if message == "" {
+		return attemptStageQualityPeekError
+	}
+	return sanitizeDiagnosticText(attemptStageQualityPeekError+": "+message, diagnosticTextLimit)
+}
+
+func shadowAttemptStage(stage string) string {
+	stage = strings.TrimSpace(stage)
+	if stage == "" {
+		return attemptStageHedgeShadowFailed
+	}
+	if strings.HasPrefix(stage, "hedge_shadow") {
+		return truncateDiagnosticText(stage, attemptStageMaxLen)
+	}
+	if stage == attemptStageQualityPeekError {
+		return attemptStageHedgeShadowPeekErr
+	}
+	if stage == attemptStageQualityHold {
+		return attemptStageHedgeShadowDegraded
+	}
+	return truncateDiagnosticText(attemptStageHedgeShadowPrefix+stage, attemptStageMaxLen)
+}
+
+func markAttemptsAsHedgeShadow(attempts []audit.Attempt, branchID int) []audit.Attempt {
+	if len(attempts) == 0 {
+		return nil
+	}
+	out := make([]audit.Attempt, len(attempts))
+	for index, attempt := range attempts {
+		attempt.Number = 0
+		if attempt.HedgeBranch == 0 && branchID > 0 {
+			attempt.HedgeBranch = branchID
+		}
+		attempt.Stage = shadowAttemptStage(attempt.Stage)
+		out[index] = attempt
+	}
+	return out
+}
+
+func filterShadowNonCancelAttempts(attempts []audit.Attempt, branchID int) []audit.Attempt {
+	if len(attempts) == 0 {
+		return nil
+	}
+	out := make([]audit.Attempt, 0, len(attempts))
+	for _, attempt := range attempts {
+		if attempt.Stage == "request_canceled" {
+			continue
+		}
+		if attempt.Source == audit.AttemptSourceCredential && strings.Contains(attempt.TransportError, context.Canceled.Error()) {
+			continue
+		}
+		attempt.Number = 0
+		if attempt.HedgeBranch == 0 && branchID > 0 {
+			attempt.HedgeBranch = branchID
+		}
+		attempt.Stage = shadowAttemptStage(attempt.Stage)
+		out = append(out, attempt)
+	}
+	return out
+}
+
+func buildHedgeShadowQualityAttempt(method, path, stage string, branchID int, credential accountdomain.Credential, startedAt time.Time, response *provider.Response, diag QualityPeekDiagnostic, transportError string) audit.Attempt {
+	status := http.StatusOK
+	upstreamStatus := "200 OK"
+	upstreamURL := ""
+	var headers map[string][]string
+	if response != nil {
+		if response.StatusCode >= 100 && response.StatusCode <= 599 {
+			status = response.StatusCode
+		}
+		if response.Status != "" {
+			upstreamStatus = response.Status
+		}
+		upstreamURL = sanitizeUpstreamURL(response.UpstreamURL)
+		headers = sanitizeDiagnosticHeaders(response.Header)
+	}
+	durationMS := time.Since(startedAt).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+	return audit.Attempt{
+		HedgeBranch:        max(0, branchID),
+		Source:             audit.AttemptSourceUpstreamHTTP,
+		Stage:              stage,
+		AccountID:          auditAccountID(credential.ID),
+		AccountName:        credential.Name,
+		Method:             method,
+		RequestPath:        sanitizeRequestPath(path),
+		UpstreamURL:        upstreamURL,
+		StartedAt:          startedAt.UTC(),
+		DurationMS:         durationMS,
+		UpstreamStatusCode: &status,
+		UpstreamStatus:     upstreamStatus,
+		ResponseHeaders:    headers,
+		ResponseBody:       marshalQualityDiagnostic(diag),
+		TransportError:     sanitizeDiagnosticText(transportError, diagnosticTextLimit),
+	}
+}
+
+func buildHedgeShadowCanceledAttempt(method, path string, branchID int, credential accountdomain.Credential, startedAt time.Time, response *provider.Response, diag QualityPeekDiagnostic, cancelReason string, err error) audit.Attempt {
+	if strings.TrimSpace(cancelReason) == "" {
+		cancelReason = attemptStageHedgeShadowCanceled
+	}
+	durationMS := time.Since(startedAt).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+	attempt := audit.Attempt{
+		HedgeBranch:    max(0, branchID),
+		Source:         audit.AttemptSourceTransport,
+		Stage:          attemptStageHedgeShadowCanceled,
+		AccountID:      auditAccountID(credential.ID),
+		AccountName:    credential.Name,
+		Method:         method,
+		RequestPath:    sanitizeRequestPath(path),
+		UpstreamURL:    sanitizeUpstreamURL(errorUpstreamURL(err)),
+		StartedAt:      startedAt.UTC(),
+		DurationMS:     durationMS,
+		TransportError: sanitizeDiagnosticText(cancelReason, diagnosticTextLimit),
+		ErrorChain:     errorFrames(err),
+	}
+	if response != nil && response.StatusCode >= 100 && response.StatusCode <= 599 {
+		status := response.StatusCode
+		attempt.Source = audit.AttemptSourceUpstreamHTTP
+		attempt.UpstreamStatusCode = &status
+		attempt.UpstreamStatus = response.Status
+		if response.UpstreamURL != "" {
+			attempt.UpstreamURL = sanitizeUpstreamURL(response.UpstreamURL)
+		}
+		attempt.ResponseHeaders = sanitizeDiagnosticHeaders(response.Header)
+		attempt.ResponseBody = marshalQualityDiagnostic(diag)
+	}
 	return attempt
 }
 
-func (r *failureAttemptRecorder) append(attempt audit.Attempt) {
+func buildHedgeShadowFallbackFailureAttempt(method, path string, branchID int, credential accountdomain.Credential, startedAt time.Time, response *provider.Response, err error) audit.Attempt {
+	durationMS := time.Since(startedAt).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+	attempt := audit.Attempt{
+		HedgeBranch: max(0, branchID),
+		Source:      audit.AttemptSourceTransport,
+		Stage:       attemptStageHedgeShadowFailed,
+		AccountID:   auditAccountID(credential.ID),
+		AccountName: credential.Name,
+		Method:      method,
+		RequestPath: sanitizeRequestPath(path),
+		UpstreamURL: sanitizeUpstreamURL(errorUpstreamURL(err)),
+		StartedAt:   startedAt.UTC(),
+		DurationMS:  durationMS,
+	}
+	if err != nil {
+		attempt.TransportError = sanitizeDiagnosticText(err.Error(), diagnosticTextLimit)
+		attempt.ErrorChain = errorFrames(err)
+	}
+	if response != nil && response.StatusCode >= 100 && response.StatusCode <= 599 {
+		status := response.StatusCode
+		attempt.Source = audit.AttemptSourceUpstreamHTTP
+		attempt.UpstreamStatusCode = &status
+		attempt.UpstreamStatus = response.Status
+		if response.UpstreamURL != "" {
+			attempt.UpstreamURL = sanitizeUpstreamURL(response.UpstreamURL)
+		}
+		attempt.ResponseHeaders = sanitizeDiagnosticHeaders(response.Header)
+	}
+	return attempt
+}
+
+func (r *failureAttemptRecorder) append(attempt audit.Attempt) audit.Attempt {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.appendLocked(attempt)
+}
+
+func (r *failureAttemptRecorder) appendLocked(attempt audit.Attempt) audit.Attempt {
+	if attempt.HedgeBranch == 0 && r.hedgeBranch > 0 {
+		attempt.HedgeBranch = r.hedgeBranch
+	}
 	attempt.Number = len(r.attempts) + 1
 	r.attempts = append(r.attempts, attempt)
+	return attempt
 }
 
 func (r *failureAttemptRecorder) appendAll(attempts []audit.Attempt) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, attempt := range attempts {
-		r.append(attempt)
+		r.appendLocked(attempt)
 	}
+}
+
+// appendBeforeSeal 尝试在主请求审计尚未封存落库前直接追加到内存记录；
+// 若主请求已进入落库流程，则返回 sealed=true 及主审计落库完成信号，交由调用方走数据库追加。
+func (r *failureAttemptRecorder) appendBeforeSeal(attempts []audit.Attempt) (bool, <-chan struct{}) {
+	if len(attempts) == 0 {
+		return false, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sealed {
+		return true, r.commitDone
+	}
+	for _, attempt := range attempts {
+		r.appendLocked(attempt)
+	}
+	return false, nil
+}
+
+// sealAndSnapshot 封存内存尝试列表并返回快照，供主请求审计写入。
+func (r *failureAttemptRecorder) sealAndSnapshot() []audit.Attempt {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sealed = true
+	return append([]audit.Attempt(nil), r.attempts...)
+}
+
+// markCommitted 通知等待主审计落库的后台影子质检：主请求审计是否已成功提交。
+func (r *failureAttemptRecorder) markCommitted(ok bool) {
+	r.mu.Lock()
+	r.commitOK = ok
+	r.mu.Unlock()
+	r.commitDoneOnce.Do(func() {
+		if r.commitDone != nil {
+			close(r.commitDone)
+		}
+	})
+}
+
+func (r *failureAttemptRecorder) commitSucceeded() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.commitOK
 }
 
 // captureBody 在单次和单请求预算内保留可读的脱敏正文片段。
@@ -351,6 +685,8 @@ func (r *failureAttemptRecorder) captureBody(body []byte, alreadyTruncated bool)
 		return nil, true
 	}
 	body = redactSensitiveDiagnosticJSON(body)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	limit := min(diagnosticBodyLimit, r.remainingBodyBudget)
 	if limit <= 0 {
 		return nil, true
@@ -411,6 +747,8 @@ func isSensitiveDiagnosticField(value string) bool {
 }
 
 func (r *failureAttemptRecorder) snapshot() []audit.Attempt {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return append([]audit.Attempt(nil), r.attempts...)
 }
 

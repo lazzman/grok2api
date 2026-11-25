@@ -40,7 +40,7 @@ type hedgeResponseParams struct {
 	egressTrace        *infraegress.Trace
 	failureAttempts    *failureAttemptRecorder
 	timing             *generationTiming
-	handoffResponse    func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, activeTrace *infraegress.Trace) *Result
+	handoffResponse    func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, activeTrace *infraegress.Trace, hedgeBranch int) *Result
 }
 
 type hedgeBranch struct {
@@ -85,6 +85,7 @@ type hedgeBranchOutcome struct {
 }
 
 type hedgeFallback struct {
+	branchID          int
 	response          *provider.Response
 	lease             *accountLease
 	credential        accountdomain.Credential
@@ -173,7 +174,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 			if fallback.response != nil {
 				upstreamURL = fallback.response.UpstreamURL
 			}
-			attempt := p.failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt, upstreamURL, fallback.diagnostic)
+			attempt := p.failureAttempts.captureQualityDegradedForBranch(fallback.branchID, fallback.credential, fallback.upstreamStartedAt, upstreamURL, fallback.diagnostic)
 			s.recordQualityDegraded(ctx, *p.auditBase, fallback.credential, fallback.usage, p.startedAt, fallback.egressTrace, p.route.Provider, &attempt)
 		}
 		if fallback.response != nil && fallback.response.Body != nil {
@@ -378,7 +379,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 					s.spawnHedgeShadowReaper(inFlight, outcomeCh, p, *p.auditBase)
 				}
 				bindHedgeResponseLifecycle(ctx, outcome.response, outcome.branch.branchCancel)
-				return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace), nil
+				return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace, outcome.branch.id), nil
 
 			case hedgeOutcomeTerminalClient:
 				stopHedgeTimer()
@@ -388,7 +389,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 					p.auditBase.ReasoningEffort = outcome.normalizedEffort
 				}
 				bindHedgeResponseLifecycle(ctx, outcome.response, outcome.branch.branchCancel)
-				return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace), nil
+				return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace, outcome.branch.id), nil
 
 			case hedgeOutcomeWithhold:
 				s.applyMissingThinkingPenalty(ctx, p.input.RequestID, outcome.credential, p.holdCfg.AccountCooldown, p.holdCfg.AutoDisable)
@@ -401,11 +402,12 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 					}
 					s.logger.Info("quality_degraded_deliver_last", append([]any{"request_id", p.input.RequestID, "account_id", outcome.credential.ID, "quality_attempt", qualityAccountAttempts, "usage_output_tokens", outcome.usage.OutputTokens}, qualityDiagnosticLogAttrs(outcome.diagnostic)...)...)
 					bindHedgeResponseLifecycle(ctx, outcome.response, outcome.branch.branchCancel)
-					return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace), nil
+					return p.handoffResponse(outcome.response, outcome.branch.lease, outcome.credential, outcome.upstreamStartedAt, outcome.egressTrace, outcome.branch.id), nil
 				}
 				if hasMore && p.holdCfg.OnExhausted == qualityRetryFailOpen {
 					discardFallback(true)
 					fallback = &hedgeFallback{
+						branchID:          outcome.branch.id,
 						response:          outcome.response,
 						lease:             outcome.branch.lease,
 						credential:        outcome.credential,
@@ -422,7 +424,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 					if outcome.response != nil {
 						upstreamURL = outcome.response.UpstreamURL
 					}
-					attempt := p.failureAttempts.captureQualityDegraded(outcome.credential, outcome.upstreamStartedAt, upstreamURL, outcome.diagnostic)
+					attempt := p.failureAttempts.captureQualityDegradedForBranch(outcome.branch.id, outcome.credential, outcome.upstreamStartedAt, upstreamURL, outcome.diagnostic)
 					s.recordQualityDegraded(ctx, *p.auditBase, outcome.credential, outcome.usage, p.startedAt, outcome.egressTrace, p.route.Provider, &attempt)
 					if outcome.response != nil && outcome.response.Body != nil {
 						_ = outcome.response.Body.Close()
@@ -478,7 +480,7 @@ func (s *Service) createHedgedResponse(ctx context.Context, p hedgeResponseParam
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", append([]any{"request_id", p.input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts}, qualityDiagnosticLogAttrs(selected.diagnostic)...)...)
 			bindHedgeResponseLifecycle(ctx, selected.response, selected.branchCancel)
-			return p.handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, selected.egressTrace), nil
+			return p.handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, selected.egressTrace, selected.branchID), nil
 		}
 		discardFallback(true)
 	}
@@ -535,7 +537,7 @@ finalizeFailure:
 func (s *Service) runHedgeBranch(branch *hedgeBranch, p hedgeResponseParams, outcomeCh chan<- hedgeBranchOutcome) {
 	branchTraceCtx, branchTrace := infraegress.WithTrace(branch.branchCtx)
 	physicalCallCtx := infraegress.WithPhysicalCallTrace(branchTraceCtx, string(p.route.Provider), string(p.operation))
-	branchAttempts := newFailureAttemptRecorder(http.MethodPost, p.path)
+	branchAttempts := newHedgeFailureAttemptRecorder(http.MethodPost, p.path, branch.id)
 	branchMeta := &provider.NormalizedRequestMetadata{}
 
 	credential := branch.credential
@@ -871,10 +873,17 @@ handleHedgeResponse:
 			_ = response.Body.Close()
 		}
 		branch.lease.Release()
-		if branch.branchCtx.Err() != nil || errors.Is(peekErr, context.Canceled) {
-			send(hedgeBranchOutcome{kind: hedgeOutcomeCanceled, err: peekErr})
+		if !neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) && (branch.branchCtx.Err() != nil || errors.Is(peekErr, context.Canceled)) {
+			responseMeta := &provider.Response{
+				StatusCode:  response.StatusCode,
+				Status:      response.Status,
+				Header:      response.Header,
+				UpstreamURL: response.UpstreamURL,
+			}
+			send(hedgeBranchOutcome{kind: hedgeOutcomeCanceled, response: responseMeta, diagnostic: peekDiag, err: peekErr})
 			return
 		}
+		branchAttempts.captureQualityPeekError(credential, upstreamStartedAt, response, peekDiag, peekErr, branch.id)
 		failure := newTransportUpstreamFailure(peekErr, credential.ID, credential.Name)
 		if neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) || errors.Is(peekErr, errQualityEmptyStream) {
 			writeCtx, writeCancel := context.WithTimeout(context.Background(), finalizationTimeout)
@@ -931,12 +940,14 @@ func (s *Service) spawnHedgeShadowReaper(
 	branches := make(map[int]*hedgeBranch, len(remaining))
 	slotHeld := make(map[int]bool, len(remaining))
 	deadlines := make(map[int]time.Time, len(remaining))
+	cancelReasons := make(map[int]string, len(remaining))
 	for id, branch := range remaining {
 		branches[id] = branch
 		if s.tryAcquireShadowQualitySlot() {
 			slotHeld[id] = true
 			deadlines[id] = branch.startedAt.Add(p.holdCfg.HoldTimeout + 2*time.Second)
 		} else {
+			cancelReasons[id] = "hedge_shadow_slot_full"
 			branch.branchCancel()
 		}
 	}
@@ -968,6 +979,7 @@ func (s *Service) spawnHedgeShadowReaper(
 			select {
 			case <-timerCh:
 				if branch, ok := branches[nextDeadlineID]; ok {
+					cancelReasons[nextDeadlineID] = "hedge_shadow_deadline_exceeded"
 					branch.branchCancel()
 				}
 				delete(deadlines, nextDeadlineID)
@@ -997,9 +1009,23 @@ func (s *Service) spawnHedgeShadowReaper(
 					}
 					outcome.branch.lease.completeSelectorObservation(true)
 					outcome.branch.lease.Release()
+					healthyAttempt := buildHedgeShadowQualityAttempt(
+						http.MethodPost,
+						p.path,
+						attemptStageHedgeShadowHealthy,
+						id,
+						outcome.credential,
+						outcome.upstreamStartedAt,
+						outcome.response,
+						outcome.diagnostic,
+						"",
+					)
+					shadowAttempts := append(markAttemptsAsHedgeShadow(outcome.attempts, id), healthyAttempt)
+					s.recordOrAppendHedgeShadowAttempts(bgCtx, p.failureAttempts, auditBaseSnapshot.EventID, p.input.RequestID, shadowAttempts)
 					s.logger.Info(
 						"quality_hedge_shadow_healthy",
 						"request_id", p.input.RequestID,
+						"hedge_branch", id,
 						"account_id", outcome.credential.ID,
 						"hedge_shadow", true,
 						"has_reasoning_delta", outcome.diagnostic.Signals.HasReasoningDelta,
@@ -1007,41 +1033,109 @@ func (s *Service) spawnHedgeShadowReaper(
 					)
 
 				case hedgeOutcomeWithhold:
-					upstreamURL := ""
-					if outcome.response != nil {
-						upstreamURL = outcome.response.UpstreamURL
-						if outcome.response.Body != nil {
-							_ = outcome.response.Body.Close()
-						}
+					if outcome.response != nil && outcome.response.Body != nil {
+						_ = outcome.response.Body.Close()
 					}
 					outcome.branch.lease.Release()
 					s.applyMissingThinkingPenalty(bgCtx, p.input.RequestID, outcome.credential, p.holdCfg.AccountCooldown, p.holdCfg.AutoDisable)
-					shadowRecorder := newFailureAttemptRecorder(http.MethodPost, p.path)
-					attempt := shadowRecorder.captureQualityDegraded(outcome.credential, outcome.upstreamStartedAt, upstreamURL, outcome.diagnostic)
-					s.recordQualityDegraded(bgCtx, auditBaseSnapshot, outcome.credential, outcome.usage, p.startedAt, outcome.egressTrace, p.route.Provider, &attempt)
+					degradedAttempt := buildHedgeShadowQualityAttempt(
+						http.MethodPost,
+						p.path,
+						attemptStageHedgeShadowDegraded,
+						id,
+						outcome.credential,
+						outcome.upstreamStartedAt,
+						outcome.response,
+						outcome.diagnostic,
+						qualityDiagnosticTransportError(outcome.diagnostic.Reason),
+					)
+					shadowAttempts := append(markAttemptsAsHedgeShadow(outcome.attempts, id), degradedAttempt)
+					s.recordOrAppendHedgeShadowAttempts(bgCtx, p.failureAttempts, auditBaseSnapshot.EventID, p.input.RequestID, shadowAttempts)
+					s.recordQualityDegraded(bgCtx, auditBaseSnapshot, outcome.credential, outcome.usage, p.startedAt, outcome.egressTrace, p.route.Provider, &degradedAttempt)
 					s.logger.Info(
 						"quality_hedge_shadow_degraded",
 						append([]any{
 							"request_id", p.input.RequestID,
+							"hedge_branch", id,
 							"account_id", outcome.credential.ID,
 							"hedge_shadow", true,
 							"usage_output_tokens", outcome.usage.OutputTokens,
 						}, qualityDiagnosticLogAttrs(outcome.diagnostic)...)...,
 					)
 
-				case hedgeOutcomeTerminalClient:
+				case hedgeOutcomeTerminalClient, hedgeOutcomeRetryableFail:
 					if outcome.response != nil && outcome.response.Body != nil {
 						_ = outcome.response.Body.Close()
 					}
 					outcome.branch.lease.Release()
+					shadowAttempts := markAttemptsAsHedgeShadow(outcome.attempts, id)
+					if len(shadowAttempts) == 0 {
+						startedAt := outcome.upstreamStartedAt
+						if startedAt.IsZero() {
+							startedAt = outcome.branch.startedAt
+						}
+						shadowAttempts = []audit.Attempt{buildHedgeShadowFallbackFailureAttempt(http.MethodPost, p.path, id, outcome.credential, startedAt, outcome.response, outcome.err)}
+					}
+					s.recordOrAppendHedgeShadowAttempts(bgCtx, p.failureAttempts, auditBaseSnapshot.EventID, p.input.RequestID, shadowAttempts)
 
-				case hedgeOutcomeRetryableFail, hedgeOutcomeCanceled:
+				case hedgeOutcomeCanceled:
 					if outcome.response != nil && outcome.response.Body != nil {
 						_ = outcome.response.Body.Close()
 					}
 					outcome.branch.lease.Release()
+					startedAt := outcome.upstreamStartedAt
+					if startedAt.IsZero() {
+						startedAt = outcome.branch.startedAt
+					}
+					cancelAttempt := buildHedgeShadowCanceledAttempt(
+						http.MethodPost,
+						p.path,
+						id,
+						outcome.credential,
+						startedAt,
+						outcome.response,
+						outcome.diagnostic,
+						cancelReasons[id],
+						outcome.err,
+					)
+					shadowAttempts := append(filterShadowNonCancelAttempts(outcome.attempts, id), cancelAttempt)
+					s.recordOrAppendHedgeShadowAttempts(bgCtx, p.failureAttempts, auditBaseSnapshot.EventID, p.input.RequestID, shadowAttempts)
 				}
 			}
 		}
 	}()
+}
+
+// recordOrAppendHedgeShadowAttempts 将影子质检分支的诊断结果聚合到主请求：
+// 主请求尚未封存审计时直接写入内存列表，已进入或完成落库时按 event_id 原子追加到数据库。
+func (s *Service) recordOrAppendHedgeShadowAttempts(ctx context.Context, recorder *failureAttemptRecorder, eventID, requestID string, attempts []audit.Attempt) {
+	if len(attempts) == 0 || recorder == nil {
+		return
+	}
+	sealed, commitDone := recorder.appendBeforeSeal(attempts)
+	if !sealed {
+		return
+	}
+	if commitDone != nil {
+		waitTimer := time.NewTimer(finalizationTimeout)
+		defer waitTimer.Stop()
+		select {
+		case <-commitDone:
+		case <-waitTimer.C:
+			s.logger.Warn("hedge_shadow_audit_wait_timeout", "event_id", eventID, "request_id", requestID)
+			return
+		}
+	}
+	if !recorder.commitSucceeded() {
+		return
+	}
+	appender, ok := s.audits.(auditAttemptAppender)
+	if !ok {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+	defer cancel()
+	if err := appender.AppendAttemptsByEventID(writeCtx, eventID, attempts); err != nil {
+		s.logger.Warn("hedge_shadow_audit_append_failed", "event_id", eventID, "request_id", requestID, "error", err)
+	}
 }
