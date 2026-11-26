@@ -90,6 +90,8 @@ import {
 import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/account-quota";
 import { AccountNameCell } from "@/features/accounts/account-name-cell";
 import { AccountQualityBadge } from "@/features/accounts/account-quality-badge";
+import { getAccountQualityQuarantine } from "@/features/accounts/account-quality";
+import { getQualityGuardStatus } from "@/features/quality-guard/quality-guard-api";
 import { WebAccountScriptsDialog } from "@/features/accounts/web-account-scripts";
 import { WebAccountSettingsDialogs, WebAccountSettingsMenu, type WebAccountConfirmationTarget } from "@/features/accounts/web-account-settings";
 import { assignEgressAccounts, listAllEgressNodes, listEgressNodes, listEgressSources, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
@@ -134,6 +136,7 @@ export function AccountsPage() {
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [qualityFilter, setQualityFilter] = useState("");
+  const [qualityWindow, setQualityWindow] = useState("24h");
   const [egressFilter, setEgressFilter] = useState("");
   const [egressFilterSelectedLabel, setEgressFilterSelectedLabel] = useState("");
   const [egressFilterOptionsOpen, setEgressFilterOptionsOpen] = useState(false);
@@ -235,17 +238,26 @@ export function AccountsPage() {
   const selected = selection.provider === provider ? selection.ids : new Set<string>();
   const selectedIdsKey = Array.from(selected).sort().join(",");
 
+  const qualityGuardQuery = useQuery({
+    queryKey: ["quality-guard", "account-quality-policy"],
+    queryFn: () => getQualityGuardStatus([]),
+    enabled: provider === "grok_build",
+    staleTime: 15_000,
+  });
+  const qualityPolicy = qualityGuardQuery.data?.config;
   const accountsQuery = useQuery({
-    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, qualityFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
+    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, qualityFilter, qualityWindow, qualityPolicy?.soft_tps, qualityPolicy?.hard_tps, qualityPolicy?.min_generation_ms, qualityPolicy?.fail_closed, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
     queryFn: () => listAccounts({
       provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter, egress: egressFilter,
       quality: qualityFilter,
+      qualityWindow, softTPS: qualityPolicy?.soft_tps, hardTPS: qualityPolicy?.hard_tps, minGenMs: qualityPolicy?.min_generation_ms, failClosed: qualityPolicy?.fail_closed,
       renewal: provider === "grok_build" ? renewalFilter : undefined,
       risk: provider === "grok_build" ? riskFilter : undefined,
       agreement: provider === "grok_web" ? agreementFilter : undefined,
       association: associationFilter || undefined,
       sortBy: sort.field, sortOrder: sort.order,
     }),
+    enabled: provider !== "grok_build" || !qualityGuardQuery.isPending,
   });
 
   const summaryQuery = useQuery({
@@ -1352,7 +1364,7 @@ export function AccountsPage() {
         <DataTableShell
         toolbar={(
           <>
-            <div className="flex w-full items-center gap-2 sm:w-auto">
+            <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
               <div className="relative min-w-0 flex-1 sm:w-64 sm:flex-none">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input className="h-8 pl-9 text-xs" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} placeholder={t("accounts.search")} aria-label={t("accounts.search")} />
@@ -1377,8 +1389,10 @@ export function AccountsPage() {
                   { value: "probing", label: t("accounts.probing") },
                 ] },
                 { id: "quality", label: t("accounts.qualityFilter"), value: qualityFilter, onChange: (value) => { setQualityFilter(value); setPage(1); }, options: [
+                  { value: "marked", label: t("accounts.qualityMarked") },
                   { value: "none", label: t("accounts.qualityNone") },
                   { value: "history", label: t("accounts.qualityHistory") },
+                  { value: "quarantined", label: t("accounts.qualityQuarantined") },
                   { value: "disabled", label: t("accounts.qualityDisabled") },
                 ] },
                 { id: "egress", label: t("accounts.egressFilter"), value: egressFilter, selectedLabel: egressFilterSelectedLabel || undefined, onChange: (value) => {
@@ -1425,6 +1439,14 @@ export function AccountsPage() {
                   { value: "webUnlinked", label: t("accounts.associationWebUnlinked") },
                 ] },
               ]} />
+              {provider === "grok_build" ? (
+                <Select value={qualityWindow} onValueChange={(value) => { setQualityWindow(value); setPage(1); }}>
+                  <SelectTrigger className="h-8 w-auto min-w-32 text-xs" aria-label={t("accounts.qualityHistoryWindow")}><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {["1h", "6h", "24h", "7d"].map((window) => <SelectItem key={window} value={window}>{t("accounts.qualityWindowOption", { window: t(`qualityGuard.degrade.windows.${window}`) })}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              ) : null}
             </div>
             {selected.size > 0 ? (
               <div className="flex flex-wrap items-center gap-1.5">
@@ -1475,12 +1497,12 @@ export function AccountsPage() {
           <Table viewportRows={20} rowHeight={56} className="table-fixed border-collapse min-w-[780px] xl:min-w-[960px] 2xl:min-w-[1080px]">
             <colgroup>
               <col style={{ width: "3%" }} />
-              <col style={{ width: "18%" }} />
+              <col style={{ width: "17%" }} />
               <col style={{ width: "7%" }} />
-              <col style={{ width: "7%" }} />
-              <col style={{ width: provider === "grok_build" ? "27%" : "43%" }} />
-              {provider === "grok_build" ? <col style={{ width: "16%" }} /> : null}
-              <col style={{ width: "18%" }} />
+              <col style={{ width: "20%" }} />
+              <col style={{ width: provider === "grok_build" ? "22%" : "35%" }} />
+              {provider === "grok_build" ? <col style={{ width: "13%" }} /> : null}
+              <col style={{ width: "14%" }} />
               <col style={{ width: "4%" }} />
             </colgroup>
             <TableHeader>
@@ -1508,9 +1530,9 @@ export function AccountsPage() {
 	                    <TableCell className="min-w-0"><AccountNameCell account={account} /></TableCell>
                     <TableCell className="text-center whitespace-nowrap">{provider === "grok_web" ? <WebAccountType tier={account.webTier} /> : provider === "grok_console" ? <AccountTypeText label={t("accountType.console")} variant="free" /> : <AccountType quota={account.quota} />}</TableCell>
                     <TableCell className="text-center whitespace-nowrap">
-                      <div className="inline-flex items-center gap-1.5">
+                      <div className="inline-flex w-full flex-col items-center">
                         <AccountStatus account={account} />
-                        <AccountQualityBadge account={account} />
+                        <AccountQualityBadge account={account} historyWindow={t(`qualityGuard.degrade.windows.${qualityWindow}`)} />
                       </div>
                     </TableCell>
                     <TableCell className={provider === "grok_build" ? undefined : "px-6"}>{provider === "grok_web" ? <WebQuota windows={account.quotaWindows ?? []} locale={i18n.language} tier={account.webTier} /> : provider === "grok_console" ? <ConsoleQuota windows={account.quotaWindows ?? []} locale={i18n.language} /> : <AccountQuota quota={account.quota} billing={account.billing} locale={i18n.language} />}</TableCell>
@@ -2409,7 +2431,7 @@ function AccountStatus({ account }: { account: AccountDTO }) {
       </StatusTooltip>
     );
   }
-  if (account.cooldownUntil && new Date(account.cooldownUntil) > new Date()) {
+  if ((account.cooldownUntil && new Date(account.cooldownUntil) > new Date()) || getAccountQualityQuarantine(account)) {
     return <Badge variant="secondary" className="bg-amber-500/10 text-amber-700 dark:text-amber-300">{t("accounts.statusCooldown")}</Badge>;
   }
   return <Badge variant="secondary" className="bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">{t("accounts.statusActive")}</Badge>;

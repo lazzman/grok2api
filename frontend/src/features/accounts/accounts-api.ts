@@ -7,6 +7,7 @@ import { createAccountTaskProgressController, type AccountTaskProgressDTO, type 
 export type { AccountTaskProgressDTO } from "@/features/accounts/account-task-progress";
 
 export type AccountProvider = "grok_build" | "grok_web" | "grok_console";
+export type AccountQualityHistory = { hits: number; soft: number; hard: number; burst: number; thinking: number; last: string };
 export type BuildRouteMode = "auto" | "build" | "xai";
 export type AccountCleanupStatus = "cooldown" | "disabled" | "reauthRequired";
 
@@ -102,6 +103,10 @@ export type AccountDTO = {
   failureCount: number;
   cooldownUntil?: string;
   lastError?: string;
+  qualityHistory?: AccountQualityHistory;
+  leaseQuarantinedUntil?: string;
+  leaseQuarantineReason?: string;
+  leaseQuarantineNodeId?: string;
   enabledDoesNotClearCooldown?: boolean;
   lastUsedAt?: string;
   linkedAccountId?: string;
@@ -194,6 +199,8 @@ const accountValidator = hasShape({
   egressNodeId: isOptional(isString), egressAssignmentMode: isOptional(isOneOf("manual", "auto")),
   lastRefreshErrorStatus: isOptional(isNumber), lastRefreshErrorCode: isOptional(isString), lastRefreshErrorMessage: isOptional(isString), lastRefreshErrorResponse: isOptional(isString), priority: isNumber, maxConcurrent: isNumber, minimumRemaining: isNumber,
   failureCount: isNumber, cooldownUntil: isOptional(isString), lastError: isOptional(isString), lastUsedAt: isOptional(isString),
+  leaseQuarantinedUntil: isOptional(isString), leaseQuarantineReason: isOptional(isString), leaseQuarantineNodeId: isOptional(isString),
+  qualityHistory: isOptional(hasShape({ hits: isNumber, soft: isNumber, hard: isNumber, burst: isNumber, thinking: isNumber, last: isString })),
   enabledDoesNotClearCooldown: isOptional(isBoolean),
   linkedAccountId: isOptional(isString), linkedAccountName: isOptional(isString), linkedProvider: isOptional(isOneOf("grok_build", "grok_web")), linkedAccounts: isOptional(isArrayOf(linkedAccountValidator)),
   createdAt: isString, billing: isOptional(billingValidator), quota: quotaValidator, quotaWindows: isOptional(isArrayOf(quotaWindowValidator)),
@@ -222,6 +229,11 @@ type ListAccountsInput = {
   type?: string;
   status?: string;
   quality?: string;
+  qualityWindow?: string;
+  softTPS?: number;
+  hardTPS?: number;
+  minGenMs?: number;
+  failClosed?: boolean;
   egress?: string;
   renewal?: string;
   risk?: string;
@@ -239,6 +251,11 @@ export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<Acc
   if (input.type) query.set("type", input.type);
   if (input.status) query.set("status", input.status);
   if (input.quality) query.set("quality", input.quality);
+  if (input.qualityWindow) query.set("qualityWindow", input.qualityWindow);
+  if (input.softTPS) query.set("softTPS", String(input.softTPS));
+  if (input.hardTPS) query.set("hardTPS", String(input.hardTPS));
+  if (input.minGenMs) query.set("minGenMs", String(input.minGenMs));
+  if (input.failClosed !== undefined) query.set("failClosed", String(input.failClosed));
   if (input.egress) query.set("egress", input.egress);
   if (input.renewal) query.set("renewal", input.renewal);
   if (input.risk) query.set("risk", input.risk);

@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -192,6 +193,8 @@ type QuotaView struct {
 
 type View struct {
 	Credential         accountdomain.Credential
+	QualityLease       *accountdomain.EgressLeaseBlock
+	QualityHistory     *repository.AccountDegradeHistory
 	Billing            *accountdomain.Billing
 	Quota              QuotaView
 	QuotaWindows       []accountdomain.QuotaWindow
@@ -308,13 +311,15 @@ type BuildConversionResult struct {
 }
 
 type ListFilter struct {
-	Provider  string
-	QuotaType string
-	Status    string
-	Quality   string
-	Egress    string
-	Renewal   string
-	Risk      string
+	Provider          string
+	QuotaType         string
+	Status            string
+	Quality           string
+	QualityWindow     string
+	QualityThresholds auditapp.DegradeThresholds
+	Egress            string
+	Renewal           string
+	Risk              string
 	// Agreement applies only to grok_web accounts.
 	Agreement string
 	// Association values are provider-specific: Web supports build, console, and combined filters;
@@ -558,7 +563,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
 		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
 		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
-		!oneOf(filter.Quality, "", "none", "history", "disabled") ||
+		!oneOf(filter.Quality, "", "marked", "none", "history", "disabled", "quarantined") ||
 		!egressValid ||
 		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
 		!oneOf(filter.Risk, "", "flagged", "normal") ||
@@ -574,10 +579,16 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		value := filter.Renewal == "refreshable"
 		refreshable = &value
 	}
+	now := s.now()
+	qualityQuery, err := auditapp.NewDegradeQuery(filter.QualityWindow, filter.QualityThresholds, now)
+	if err != nil {
+		return nil, 0, ErrInvalidFilter
+	}
 	repositoryFilter := repository.AccountListFilter{
 		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Quality: filter.Quality, Egress: egressMode,
 		EgressNodeID: egressNodeID, EgressSourceID: egressSourceID,
-		Refreshable: refreshable, Agreement: filter.Agreement, Association: filter.Association, Now: s.now(),
+		Refreshable: refreshable, Agreement: filter.Agreement, Association: filter.Association, Now: now,
+		QualityQuery: &qualityQuery,
 	}
 	if filter.Risk != "" {
 		if _, ok := s.accounts.(buildBotFlagIndexRepository); ok {
@@ -622,10 +633,24 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	if err != nil {
 		return nil, 0, err
 	}
+	qualityLeases, err := s.accounts.GetActiveEgressLeaseBlocks(ctx, accountIDs, now)
+	if err != nil {
+		return nil, 0, err
+	}
+	qualityHistory, err := s.audits.GetAccountDegradeHistory(ctx, accountIDs, qualityQuery)
+	if err != nil {
+		return nil, 0, err
+	}
 	views := make([]View, 0, len(values))
 	for _, value := range values {
 		metadata := s.buildBotFlagMetadata(value)
 		view := View{Credential: value, BuildBotFlagged: metadata.BuildBotFlagged, BuildBotFlagSource: metadata.BuildBotFlagSource}
+		if lease, ok := qualityLeases[value.ID]; ok {
+			view.QualityLease = &lease
+		}
+		if history, ok := qualityHistory[value.ID]; ok {
+			view.QualityHistory = &history
+		}
 		if billing, ok := billings[value.ID]; ok {
 			view.Billing = &billing
 		}
@@ -1066,6 +1091,24 @@ func (s *Service) Get(ctx context.Context, id uint64) (View, error) {
 	}
 	metadata := s.buildBotFlagMetadata(value)
 	view := View{Credential: value, BuildBotFlagged: metadata.BuildBotFlagged, BuildBotFlagSource: metadata.BuildBotFlagSource}
+	qualityLeases, err := s.accounts.GetActiveEgressLeaseBlocks(ctx, []uint64{id}, s.now())
+	if err != nil {
+		return View{}, err
+	}
+	if lease, ok := qualityLeases[id]; ok {
+		view.QualityLease = &lease
+	}
+	qualityQuery, err := auditapp.NewDegradeQuery("", auditapp.DegradeThresholds{}, s.now())
+	if err != nil {
+		return View{}, err
+	}
+	qualityHistory, err := s.audits.GetAccountDegradeHistory(ctx, []uint64{id}, qualityQuery)
+	if err != nil {
+		return View{}, err
+	}
+	if history, ok := qualityHistory[id]; ok {
+		view.QualityHistory = &history
+	}
 	if billing, err := s.accounts.GetBilling(ctx, id); err == nil {
 		view.Billing = &billing
 	} else if !errors.Is(err, repository.ErrNotFound) {

@@ -892,7 +892,7 @@ func (r *AuditRepository) SummarizeDegrade(ctx context.Context, input repository
 	}
 	var result repository.DegradeSummaryResult
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		classified := r.degradeClassifiedQuery(tx, input)
+		classified := degradeClassifiedQuery(tx, r.db.dialect, input)
 		var totals degradeTotalsRow
 		if err := tx.Table("(?) AS d", classified).
 			Select(`COUNT(*) AS hits,
@@ -1016,9 +1016,9 @@ func (r *AuditRepository) SummarizeDegrade(ctx context.Context, input repository
 	return result, err
 }
 
-func (r *AuditRepository) degradeClassifiedQuery(tx *gorm.DB, input repository.DegradeSummaryQuery) *gorm.DB {
+func degradeClassifiedQuery(tx *gorm.DB, dialect string, input repository.DegradeSummaryQuery) *gorm.DB {
 	castType := "REAL"
-	if r.db.dialect == "postgres" {
+	if dialect == "postgres" {
 		castType = "DOUBLE PRECISION"
 	}
 	generationExpression := fmt.Sprintf("(CASE WHEN a.reasoning_tokens > 0 AND a.duration_ms - a.first_token_ms < a.first_token_ms AND a.duration_ms - a.first_token_ms < %d THEN a.duration_ms ELSE a.duration_ms - a.first_token_ms END)", audit.DefaultDegradeMinGenMS)

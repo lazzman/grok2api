@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -111,5 +112,113 @@ func TestAccountQualityFilter(test *testing.T) {
 				test.Fatalf("账号 = %v，期望 %v", names, want)
 			}
 		})
+	}
+}
+
+func TestAccountQualityLeaseFilterMatchesMetadataAndRecovery(test *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(test.TempDir(), "quality-lease-filter.db"))
+	if err != nil {
+		test.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		test.Fatal(err)
+	}
+	nodes := NewEgressRepository(database)
+	firstNode, err := nodes.CreateEgressNode(ctx, egressdomain.Node{Name: "隔离出口一", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "encrypted"})
+	if err != nil {
+		test.Fatal(err)
+	}
+	secondNode, err := nodes.CreateEgressNode(ctx, egressdomain.Node{Name: "隔离出口二", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "encrypted"})
+	if err != nil {
+		test.Fatal(err)
+	}
+	now := time.Now().UTC()
+	until := now.Add(time.Hour)
+	ids := map[string]uint64{}
+	for _, name := range []string{"active", "expired", "boundary", "rebound", "disabled", "reauth", "history", "both"} {
+		row := accountModel{IdentityKey: testIdentityKey(name), Name: name, SourceKey: name, Provider: "grok_build", Enabled: name != "disabled", AuthStatus: "active"}
+		if name == "reauth" {
+			row.AuthStatus = "reauthRequired"
+		}
+		if name == "rebound" {
+			row.EgressNodeID = &secondNode.ID
+		}
+		if name == "history" || name == "both" {
+			row.LastError = account.LastErrorMissingThinking
+		}
+		if err := database.db.Create(&row).Error; err != nil {
+			test.Fatal(err)
+		}
+		ids[name] = row.ID
+		if name == "history" {
+			continue
+		}
+		deadline := until
+		if name == "expired" {
+			deadline = now.Add(-time.Second)
+		}
+		if name == "boundary" {
+			deadline = now
+		}
+		if err := database.db.Create(&accountEgressLeaseBlockModel{AccountID: row.ID, NodeID: firstNode.ID, Reason: "soft_tps", Version: "quality-test-version", CooldownUntil: deadline, UpdatedAt: now}).Error; err != nil {
+			test.Fatal(err)
+		}
+	}
+	longer := until.Add(time.Hour)
+	if err := database.db.Create(&accountEgressLeaseBlockModel{AccountID: ids["active"], NodeID: secondNode.ID, Reason: "hard_tps", Version: "quality-second-version", CooldownUntil: longer, UpdatedAt: now}).Error; err != nil {
+		test.Fatal(err)
+	}
+	accounts := NewAccountRepository(database)
+	for _, scenario := range []struct {
+		quality string
+		status  string
+		want    []string
+	}{
+		{"quarantined", "", []string{"active", "both"}},
+		{"marked", "", []string{"active", "both", "history"}},
+		{"none", "", []string{"boundary", "disabled", "expired", "reauth", "rebound"}},
+		{"history", "", []string{"both", "history"}},
+		{"quarantined", "active", nil},
+		{"quarantined", "disabled", nil},
+		{"disabled", "", nil},
+		{"quarantined", "cooldown", []string{"active", "both"}},
+	} {
+		test.Run(scenario.quality+"/"+scenario.status, func(test *testing.T) {
+			values, total, err := accounts.List(ctx, repository.AccountListQuery{
+				Page:   repository.PageQuery{Limit: 20, Sort: repository.SortQuery{Field: "name", Direction: repository.SortAscending}},
+				Filter: repository.AccountListFilter{Quality: scenario.quality, Status: scenario.status, Now: now},
+			})
+			if err != nil {
+				test.Fatal(err)
+			}
+			var names []string
+			for _, value := range values {
+				names = append(names, value.Name)
+			}
+			if !slices.Equal(names, scenario.want) || total != int64(len(scenario.want)) {
+				test.Fatalf("筛选结果 = %v，总数 = %d，期望 %v", names, total, scenario.want)
+			}
+		})
+	}
+	blocks, err := accounts.GetActiveEgressLeaseBlocks(ctx, []uint64{ids["active"], ids["expired"], ids["boundary"], ids["rebound"], ids["disabled"], ids["reauth"], ids["history"]}, now)
+	if err != nil || len(blocks) != 1 || !blocks[ids["active"]].CooldownUntil.Equal(longer) || blocks[ids["active"]].Reason != "hard_tps" {
+		test.Fatalf("仅加载指定账号的有效隔离，选取最晚截止时间：%#v，%v", blocks, err)
+	}
+	summary, err := accounts.Summarize(ctx, now)
+	if err != nil || len(summary) != 1 || summary[0].Cooldown != 2 || summary[0].Available != 4 {
+		test.Fatalf("隔离账号不应计入可用：%#v，%v", summary, err)
+	}
+	blocks, err = accounts.GetActiveEgressLeaseBlocks(ctx, []uint64{ids["active"]}, longer)
+	if err != nil || len(blocks) != 0 {
+		test.Fatalf("到期后隔离应消失：%#v，%v", blocks, err)
+	}
+	if err := database.db.Model(&egressNodeModel{}).Where("id IN ?", []uint64{firstNode.ID, secondNode.ID}).Update("enabled", false).Error; err != nil {
+		test.Fatal(err)
+	}
+	blocks, err = accounts.GetActiveEgressLeaseBlocks(ctx, []uint64{ids["active"], ids["both"]}, now)
+	if err != nil || len(blocks) != 0 {
+		test.Fatalf("出口已停用，不展示残留隔离：%#v，%v", blocks, err)
 	}
 }

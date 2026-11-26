@@ -161,6 +161,18 @@ func resolveDegradeWindow(value string, now time.Time) (string, time.Time, time.
 	return value, now.Add(-duration), now, nil
 }
 
+func NewDegradeQuery(window string, thresholds DegradeThresholds, now time.Time) (repository.DegradeSummaryQuery, error) {
+	_, start, end, err := resolveDegradeWindow(window, now.UTC())
+	if err != nil {
+		return repository.DegradeSummaryQuery{}, err
+	}
+	thresholds = normalizeDegradeThresholds(thresholds)
+	return repository.DegradeSummaryQuery{
+		Start: start, End: end, SoftTPS: thresholds.SoftTPS, HardTPS: thresholds.HardTPS,
+		MinGenerationMS: thresholds.MinGenMS, MinOutputTokens: thresholds.MinOut, FailClosed: thresholds.FailClosed,
+	}, nil
+}
+
 func normalizeDegradeThresholds(value DegradeThresholds) DegradeThresholds {
 	if value.SoftTPS <= 0 || math.IsNaN(value.SoftTPS) || math.IsInf(value.SoftTPS, 0) {
 		value.SoftTPS = auditdomain.DefaultDegradeSoftTPS

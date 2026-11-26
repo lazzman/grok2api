@@ -16,6 +16,7 @@ import (
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
+	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"github.com/chenyme/grok2api/backend/internal/shared/response"
@@ -282,34 +283,38 @@ type accountImportResponse struct {
 }
 
 type accountResponse struct {
-	ID                       uint64     `json:"id,string"`
-	Provider                 string     `json:"provider"`
-	AuthType                 string     `json:"authType"`
-	WebTier                  string     `json:"webTier,omitempty"`
-	WebTierSyncedAt          *time.Time `json:"webTierSyncedAt,omitempty"`
-	WebNSFWEnabledAt         *time.Time `json:"nsfwEnabledAt,omitempty"`
-	WebTermsAcceptedAt       *time.Time `json:"termsAcceptedAt,omitempty"`
-	Name                     string     `json:"name"`
-	Email                    string     `json:"email,omitempty"`
-	UserID                   string     `json:"userId,omitempty"`
-	TeamID                   string     `json:"teamId,omitempty"`
-	Enabled                  bool       `json:"enabled"`
-	AuthStatus               string     `json:"authStatus"`
-	ExpiresAt                *time.Time `json:"expiresAt,omitempty"`
-	Refreshable              bool       `json:"refreshable"`
-	RefreshDueAt             *time.Time `json:"refreshDueAt,omitempty"`
-	LastRefreshAt            *time.Time `json:"lastRefreshAt,omitempty"`
-	RefreshFailures          int        `json:"refreshFailureCount"`
-	LastRefreshErrorStatus   int        `json:"lastRefreshErrorStatus,omitempty"`
-	LastRefreshError         string     `json:"lastRefreshErrorCode,omitempty"`
-	LastRefreshErrorMessage  string     `json:"lastRefreshErrorMessage,omitempty"`
-	LastRefreshErrorResponse string     `json:"lastRefreshErrorResponse,omitempty"`
-	Priority                 int        `json:"priority"`
-	MaxConcurrent            int        `json:"maxConcurrent"`
-	MinimumRemaining         float64    `json:"minimumRemaining"`
-	FailureCount             int        `json:"failureCount"`
-	CooldownUntil            *time.Time `json:"cooldownUntil,omitempty"`
-	LastError                string     `json:"lastError,omitempty"`
+	ID                       uint64                         `json:"id,string"`
+	Provider                 string                         `json:"provider"`
+	AuthType                 string                         `json:"authType"`
+	WebTier                  string                         `json:"webTier,omitempty"`
+	WebTierSyncedAt          *time.Time                     `json:"webTierSyncedAt,omitempty"`
+	WebNSFWEnabledAt         *time.Time                     `json:"nsfwEnabledAt,omitempty"`
+	WebTermsAcceptedAt       *time.Time                     `json:"termsAcceptedAt,omitempty"`
+	Name                     string                         `json:"name"`
+	Email                    string                         `json:"email,omitempty"`
+	UserID                   string                         `json:"userId,omitempty"`
+	TeamID                   string                         `json:"teamId,omitempty"`
+	Enabled                  bool                           `json:"enabled"`
+	AuthStatus               string                         `json:"authStatus"`
+	ExpiresAt                *time.Time                     `json:"expiresAt,omitempty"`
+	Refreshable              bool                           `json:"refreshable"`
+	RefreshDueAt             *time.Time                     `json:"refreshDueAt,omitempty"`
+	LastRefreshAt            *time.Time                     `json:"lastRefreshAt,omitempty"`
+	RefreshFailures          int                            `json:"refreshFailureCount"`
+	LastRefreshErrorStatus   int                            `json:"lastRefreshErrorStatus,omitempty"`
+	LastRefreshError         string                         `json:"lastRefreshErrorCode,omitempty"`
+	LastRefreshErrorMessage  string                         `json:"lastRefreshErrorMessage,omitempty"`
+	LastRefreshErrorResponse string                         `json:"lastRefreshErrorResponse,omitempty"`
+	Priority                 int                            `json:"priority"`
+	MaxConcurrent            int                            `json:"maxConcurrent"`
+	MinimumRemaining         float64                        `json:"minimumRemaining"`
+	FailureCount             int                            `json:"failureCount"`
+	CooldownUntil            *time.Time                     `json:"cooldownUntil,omitempty"`
+	LastError                string                         `json:"lastError,omitempty"`
+	LeaseQuarantinedUntil    *time.Time                     `json:"leaseQuarantinedUntil,omitempty"`
+	LeaseQuarantineReason    string                         `json:"leaseQuarantineReason,omitempty"`
+	LeaseQuarantineNodeID    uint64                         `json:"leaseQuarantineNodeId,omitempty,string"`
+	QualityHistory           *accountQualityHistoryResponse `json:"qualityHistory,omitempty"`
 	// EnabledDoesNotClearCooldown is set on PATCH when enabled was changed
 	// while the account is still cooling. Toggling enabled is not a health reset.
 	EnabledDoesNotClearCooldown bool                    `json:"enabledDoesNotClearCooldown,omitempty"`
@@ -414,12 +419,27 @@ type quotaResponse struct {
 	LastConfirmedAt *time.Time `json:"lastConfirmedAt,omitempty"`
 }
 
+type accountQualityHistoryResponse struct {
+	Hits     int64     `json:"hits"`
+	Soft     int64     `json:"soft"`
+	Hard     int64     `json:"hard"`
+	Burst    int64     `json:"burst"`
+	Thinking int64     `json:"thinking"`
+	Last     time.Time `json:"last"`
+}
+
 func (h *Handler) list(c *gin.Context) {
 	page, pageSize := pagination(c)
+	softTPS, _ := strconv.ParseFloat(c.Query("softTPS"), 64)
+	hardTPS, _ := strconv.ParseFloat(c.Query("hardTPS"), 64)
+	minGenMS, _ := strconv.ParseInt(c.Query("minGenMs"), 10, 64)
+	failClosed, _ := strconv.ParseBool(c.Query("failClosed"))
 	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), accountapp.ListFilter{
 		Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"), Egress: c.Query("egress"),
-		Quality: c.Query("quality"),
-		Renewal: c.Query("renewal"), Risk: c.Query("risk"), Agreement: c.Query("agreement"), Association: c.Query("association"),
+		Quality:           c.Query("quality"),
+		QualityWindow:     c.Query("qualityWindow"),
+		QualityThresholds: auditapp.DegradeThresholds{SoftTPS: softTPS, HardTPS: hardTPS, MinGenMS: minGenMS, FailClosed: failClosed},
+		Renewal:           c.Query("renewal"), Risk: c.Query("risk"), Agreement: c.Query("agreement"), Association: c.Query("association"),
 		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
 	})
 	if errors.Is(err, accountapp.ErrInvalidFilter) {
@@ -1549,6 +1569,15 @@ func newAccountResponse(value accountapp.View) accountResponse {
 	if value.Billing != nil {
 		billing := newBillingResponse(*value.Billing)
 		result.Billing = &billing
+	}
+	if value.QualityLease != nil {
+		result.LeaseQuarantinedUntil = &value.QualityLease.CooldownUntil
+		result.LeaseQuarantineReason = value.QualityLease.Reason
+		result.LeaseQuarantineNodeID = value.QualityLease.NodeID
+	}
+	if value.QualityHistory != nil {
+		history := value.QualityHistory
+		result.QualityHistory = &accountQualityHistoryResponse{Hits: history.Hits, Soft: history.Soft, Hard: history.Hard, Burst: history.Burst, Thinking: history.Thinking, Last: history.Last}
 	}
 	return result
 }

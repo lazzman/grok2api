@@ -56,7 +56,7 @@ const (
 	accountRecoveryPredicate                  = `EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status IN ('exhausted', 'probing'))`
 	providerQuotaExhaustedPredicate           = `((provider_accounts.provider = 'grok_web' AND ((EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly') AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly' AND quota.remaining > 0)) OR (NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly') AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id) AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.remaining > 0)))) OR (provider_accounts.provider = 'grok_console' AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'console') AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'console' AND quota.remaining > 0)))`
 	accountTypeSortExpression                 = `CASE WHEN provider_accounts.provider = 'grok_web' THEN COALESCE((SELECT profile.tier FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id), 'auto') WHEN ` + accountBuildSuperPredicate + ` THEN 'paid' WHEN ` + accountFreeSignalPredicate + ` THEN 'free' ELSE 'unknown' END`
-	accountStatusSortExpression               = `CASE WHEN provider_accounts.enabled = FALSE THEN 4 WHEN provider_accounts.auth_status = 'reauthRequired' THEN 5 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 3 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + ` THEN 2 WHEN provider_accounts.cooldown_until > CURRENT_TIMESTAMP THEN 1 ELSE 0 END`
+	accountStatusSortExpression               = `CASE WHEN provider_accounts.enabled = FALSE THEN 4 WHEN provider_accounts.auth_status = 'reauthRequired' THEN 5 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 3 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + ` THEN 2 WHEN provider_accounts.cooldown_until > CURRENT_TIMESTAMP OR ` + accountCurrentQualityLeasePredicate + ` THEN 1 ELSE 0 END`
 	accountUnclassifiedRefreshReauthPredicate = `NOT EXISTS (SELECT 1 FROM account_credentials credential WHERE credential.account_id = provider_accounts.id AND credential.refresh_permanent = FALSE AND credential.refresh_unclassified_auth_failures > 0)`
 	missingConsoleAccountPredicate            = `NOT EXISTS (SELECT 1 FROM provider_accounts AS console_account WHERE console_account.provider = ? AND console_account.source_key = ('console-' || provider_accounts.source_key))`
 )
@@ -90,10 +90,17 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 	}
 	query = applyAccountStatusFilter(query, input.Filter.Status, input.Filter.Now)
 	switch input.Filter.Quality {
+	case "marked":
+		query = query.Where("last_error IN ? OR "+accountActiveQualityLeasePredicate+" OR EXISTS (?)", []string{account.LastErrorMissingThinking, account.LastErrorMissingThinkingDisabled}, input.Filter.Now, r.accountDegradeHistoryQuery(ctx, input.Filter))
+	case "quarantined":
+		query = query.Where(accountActiveQualityLeasePredicate, input.Filter.Now)
 	case "none":
 		query = query.Where("last_error IS NULL OR last_error NOT IN ?", []string{account.LastErrorMissingThinking, account.LastErrorMissingThinkingDisabled})
+		query = query.Where("NOT "+accountActiveQualityLeasePredicate, input.Filter.Now)
+		query = query.Where("NOT EXISTS (?)", r.accountDegradeHistoryQuery(ctx, input.Filter))
 	case "history":
-		query = query.Where("last_error = ? OR (last_error = ? AND enabled = ?)", account.LastErrorMissingThinking, account.LastErrorMissingThinkingDisabled, true)
+		query = query.Where("last_error IN ? OR EXISTS (?)", []string{account.LastErrorMissingThinking, account.LastErrorMissingThinkingDisabled}, r.accountDegradeHistoryQuery(ctx, input.Filter))
+		query = query.Where("enabled = ? OR last_error IS NULL OR last_error <> ?", true, account.LastErrorMissingThinkingDisabled)
 	case "disabled":
 		query = query.Where("last_error = ? AND enabled = ?", account.LastErrorMissingThinkingDisabled, false)
 	}
@@ -343,16 +350,16 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 	selectFields := `
 		provider,
 		COUNT(*) AS total,
-		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND (cooldown_until IS NULL OR cooldown_until <= ?) THEN 1 ELSE 0 END) AS available,
-		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND cooldown_until > ? THEN 1 ELSE 0 END) AS cooldown,
+		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND (cooldown_until IS NULL OR cooldown_until <= ?) AND NOT ` + accountActiveQualityLeasePredicate + ` THEN 1 ELSE 0 END) AS available,
+		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND (cooldown_until > ? OR ` + accountActiveQualityLeasePredicate + `) THEN 1 ELSE 0 END) AS cooldown,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND (EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + `) THEN 1 ELSE 0 END) AS waiting_reset,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 1 ELSE 0 END) AS probing,
 		SUM(CASE WHEN enabled = ? THEN 1 ELSE 0 END) AS disabled,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? THEN 1 ELSE 0 END) AS reauth_required`
 	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Select(
 		selectFields,
-		true, account.AuthStatusActive, now,
-		true, account.AuthStatusActive, now,
+		true, account.AuthStatusActive, now, now,
+		true, account.AuthStatusActive, now, now,
 		true, account.AuthStatusActive,
 		true, account.AuthStatusActive,
 		false,
@@ -2005,13 +2012,13 @@ func rejectAccountsWithMediaJobs(db *gorm.DB, ids []uint64) error {
 func applyAccountStatusFilter(query *gorm.DB, status string, now time.Time) *gorm.DB {
 	switch status {
 	case "active":
-		return query.Where("enabled = ? AND auth_status = ? AND NOT "+accountRecoveryPredicate+" AND NOT "+providerQuotaExhaustedPredicate+" AND (cooldown_until IS NULL OR cooldown_until <= ?)", true, account.AuthStatusActive, now)
+		return query.Where("enabled = ? AND auth_status = ? AND NOT "+accountRecoveryPredicate+" AND NOT "+providerQuotaExhaustedPredicate+" AND (cooldown_until IS NULL OR cooldown_until <= ?) AND NOT "+accountActiveQualityLeasePredicate, true, account.AuthStatusActive, now, now)
 	case "disabled":
 		return query.Where("enabled = ?", false)
 	case "reauthRequired":
 		return query.Where("enabled = ? AND auth_status = ?", true, account.AuthStatusReauthRequired)
 	case "cooldown":
-		return query.Where("enabled = ? AND auth_status = ? AND NOT "+accountRecoveryPredicate+" AND cooldown_until > ?", true, account.AuthStatusActive, now)
+		return query.Where("enabled = ? AND auth_status = ? AND NOT "+accountRecoveryPredicate+" AND (cooldown_until > ? OR "+accountActiveQualityLeasePredicate+")", true, account.AuthStatusActive, now, now)
 	case "waitingReset":
 		return query.Where("enabled = ? AND auth_status = ? AND (EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR "+providerQuotaExhaustedPredicate+")", true, account.AuthStatusActive)
 	case "probing":
