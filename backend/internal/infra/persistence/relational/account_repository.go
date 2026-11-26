@@ -89,6 +89,14 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 		query = query.Where("EXISTS (SELECT 1 FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id AND profile.tier = ?)", input.Filter.QuotaType)
 	}
 	query = applyAccountStatusFilter(query, input.Filter.Status, input.Filter.Now)
+	switch input.Filter.Quality {
+	case "none":
+		query = query.Where("last_error IS NULL OR last_error NOT IN ?", []string{account.LastErrorMissingThinking, account.LastErrorMissingThinkingDisabled})
+	case "history":
+		query = query.Where("last_error = ? OR (last_error = ? AND enabled = ?)", account.LastErrorMissingThinking, account.LastErrorMissingThinkingDisabled, true)
+	case "disabled":
+		query = query.Where("last_error = ? AND enabled = ?", account.LastErrorMissingThinkingDisabled, false)
+	}
 	switch input.Filter.Egress {
 	case "bound":
 		query = query.Where("egress_node_id IS NOT NULL")

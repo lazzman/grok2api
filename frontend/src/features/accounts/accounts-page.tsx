@@ -89,6 +89,7 @@ import {
 } from "@/features/accounts/accounts-api";
 import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/account-quota";
 import { AccountNameCell } from "@/features/accounts/account-name-cell";
+import { AccountQualityBadge } from "@/features/accounts/account-quality-badge";
 import { WebAccountScriptsDialog } from "@/features/accounts/web-account-scripts";
 import { WebAccountSettingsDialogs, WebAccountSettingsMenu, type WebAccountConfirmationTarget } from "@/features/accounts/web-account-settings";
 import { assignEgressAccounts, listAllEgressNodes, listEgressNodes, listEgressSources, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
@@ -132,6 +133,7 @@ export function AccountsPage() {
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [qualityFilter, setQualityFilter] = useState("");
   const [egressFilter, setEgressFilter] = useState("");
   const [egressFilterSelectedLabel, setEgressFilterSelectedLabel] = useState("");
   const [egressFilterOptionsOpen, setEgressFilterOptionsOpen] = useState(false);
@@ -234,9 +236,10 @@ export function AccountsPage() {
   const selectedIdsKey = Array.from(selected).sort().join(",");
 
   const accountsQuery = useQuery({
-    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
+    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, qualityFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
     queryFn: () => listAccounts({
       provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter, egress: egressFilter,
+      quality: qualityFilter,
       renewal: provider === "grok_build" ? renewalFilter : undefined,
       risk: provider === "grok_build" ? riskFilter : undefined,
       agreement: provider === "grok_web" ? agreementFilter : undefined,
@@ -1008,6 +1011,7 @@ export function AccountsPage() {
     setSelection({ provider: value, ids: new Set() });
     setTypeFilter("");
     setStatusFilter("");
+    setQualityFilter("");
     // A node or subscription narrowing belongs to the previous pool's scope;
     // keep the plain bound filter and drop the target.
     setEgressFilter((current) => (current.includes(":") ? "bound" : current));
@@ -1372,6 +1376,11 @@ export function AccountsPage() {
                   { value: "waitingReset", label: t("accounts.waitingReset") },
                   { value: "probing", label: t("accounts.probing") },
                 ] },
+                { id: "quality", label: t("accounts.qualityFilter"), value: qualityFilter, onChange: (value) => { setQualityFilter(value); setPage(1); }, options: [
+                  { value: "none", label: t("accounts.qualityNone") },
+                  { value: "history", label: t("accounts.qualityHistory") },
+                  { value: "disabled", label: t("accounts.qualityDisabled") },
+                ] },
                 { id: "egress", label: t("accounts.egressFilter"), value: egressFilter, selectedLabel: egressFilterSelectedLabel || undefined, onChange: (value) => {
                   setEgressFilter(value);
                   setEgressFilterSelectedLabel(value.includes(":")
@@ -1498,7 +1507,12 @@ export function AccountsPage() {
                     <TableCell className="px-2"><Checkbox checked={selected.has(account.id)} onCheckedChange={(checked) => toggleAccount(account.id, checked === true)} aria-label={t("common.selectItem", { name: account.name })} /></TableCell>
 	                    <TableCell className="min-w-0"><AccountNameCell account={account} /></TableCell>
                     <TableCell className="text-center whitespace-nowrap">{provider === "grok_web" ? <WebAccountType tier={account.webTier} /> : provider === "grok_console" ? <AccountTypeText label={t("accountType.console")} variant="free" /> : <AccountType quota={account.quota} />}</TableCell>
-                    <TableCell className="text-center whitespace-nowrap"><AccountStatus account={account} /></TableCell>
+                    <TableCell className="text-center whitespace-nowrap">
+                      <div className="inline-flex items-center gap-1.5">
+                        <AccountStatus account={account} />
+                        <AccountQualityBadge account={account} />
+                      </div>
+                    </TableCell>
                     <TableCell className={provider === "grok_build" ? undefined : "px-6"}>{provider === "grok_web" ? <WebQuota windows={account.quotaWindows ?? []} locale={i18n.language} tier={account.webTier} /> : provider === "grok_console" ? <ConsoleQuota windows={account.quotaWindows ?? []} locale={i18n.language} /> : <AccountQuota quota={account.quota} billing={account.billing} locale={i18n.language} />}</TableCell>
                     {provider === "grok_build" ? <TableCell className="whitespace-nowrap pl-4 text-xs">
                       {account.refreshable ? (

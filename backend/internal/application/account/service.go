@@ -311,6 +311,7 @@ type ListFilter struct {
 	Provider  string
 	QuotaType string
 	Status    string
+	Quality   string
 	Egress    string
 	Renewal   string
 	Risk      string
@@ -557,6 +558,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
 		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
 		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
+		!oneOf(filter.Quality, "", "none", "history", "disabled") ||
 		!egressValid ||
 		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
 		!oneOf(filter.Risk, "", "flagged", "normal") ||
@@ -573,7 +575,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		refreshable = &value
 	}
 	repositoryFilter := repository.AccountListFilter{
-		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Egress: egressMode,
+		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Quality: filter.Quality, Egress: egressMode,
 		EgressNodeID: egressNodeID, EgressSourceID: egressSourceID,
 		Refreshable: refreshable, Agreement: filter.Agreement, Association: filter.Association, Now: s.now(),
 	}

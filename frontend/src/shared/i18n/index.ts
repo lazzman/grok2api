@@ -2343,6 +2343,14 @@ Object.assign(resources["zh-CN"].translation.settings.egress as unknown as Recor
 
 Object.assign(resources["zh-CN"].translation.accounts as unknown as Record<string, string>, {
   clearCooldown: "解除冷却",
+  qualityHistory: "曾降智",
+  qualityFilter: "降智标记",
+  qualityNone: "无降智标记",
+  qualityDisabled: "降智停用",
+  qualityDetails: "{{label}}：查看降智标记说明",
+  qualityHistoryHelp: "该账号曾命中降智规则。冷却结束或手动解除冷却不会清除标记；恢复调度后再次命中将停用。",
+  qualityDisabledHelp: "该账号已因降智被停用，不会自动恢复，需人工启用。启用后仍保留降智标记，再次命中将停用。",
+  qualityCooldownUntil: "冷却截止：",
   cooldownCleared: "账号冷却已清除，可重新调度",
   enabledDoesNotClearCooldown: "已开关账号，但冷却状态未变。请用「解除冷却」清除 cooldownUntil。",
   importAuth: "导入账号或 RT 文件", quickImportRT: "快速导入 RT",
@@ -2358,6 +2366,14 @@ Object.assign(resources["zh-CN"].translation.accounts as unknown as Record<strin
 
 Object.assign(resources.en.translation.accounts as unknown as Record<string, string>, {
   clearCooldown: "Clear cooldown",
+  qualityHistory: "Quality strike",
+  qualityFilter: "Quality marker",
+  qualityNone: "No quality marker",
+  qualityDisabled: "Quality disabled",
+  qualityDetails: "{{label}}: view quality strike details",
+  qualityHistoryHelp: "This account previously triggered a quality rule. Expiring or clearing the cooldown keeps the strike. Another hit after scheduling resumes will disable the account.",
+  qualityDisabledHelp: "This account was disabled for degraded quality and will not recover automatically. Enable it manually to resume use. The strike remains, and another hit will disable it again.",
+  qualityCooldownUntil: "Cooldown ends: ",
   cooldownCleared: "Account cooldown cleared; the account can be scheduled again",
   enabledDoesNotClearCooldown: "Enabled state changed, but cooldown is unchanged. Use Clear cooldown to reset cooldownUntil.",
   importAuth: "Import accounts or RTs", quickImportRT: "Quick import RTs",
